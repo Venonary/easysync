@@ -21,10 +21,10 @@ const state = reactive({
 })
 
 const text = ref('')
-const activeConversationId = ref(localStorage.getItem(STORAGE_ACTIVE_CONVERSATION) || '')
+const activeConversationId = ref(safeStorageGet(STORAGE_ACTIVE_CONVERSATION))
 const deviceId = getOrCreateDeviceId()
-const deviceName = ref(localStorage.getItem(STORAGE_DEVICE_NAME) || defaultDeviceName())
-const themeMode = ref(localStorage.getItem(STORAGE_THEME) || 'system')
+const deviceName = ref(safeStorageGet(STORAGE_DEVICE_NAME) || defaultDeviceName())
+const themeMode = ref(safeStorageGet(STORAGE_THEME) || 'system')
 const systemPrefersDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches)
 const socket = ref(null)
 const messageList = ref(null)
@@ -74,15 +74,15 @@ const canCopyImage = computed(() => {
 })
 
 watch(deviceName, (value) => {
-  localStorage.setItem(STORAGE_DEVICE_NAME, value.trim() || defaultDeviceName())
+  safeStorageSet(STORAGE_DEVICE_NAME, value.trim() || defaultDeviceName())
 })
 
 watch(activeConversationId, (value) => {
-  if (value) localStorage.setItem(STORAGE_ACTIVE_CONVERSATION, value)
+  if (value) safeStorageSet(STORAGE_ACTIVE_CONVERSATION, value)
 })
 
 watch(themeMode, (value) => {
-  localStorage.setItem(STORAGE_THEME, value)
+  safeStorageSet(STORAGE_THEME, value)
 })
 
 watch(effectiveTheme, (value) => {
@@ -477,12 +477,28 @@ function onTextareaKeydown(event) {
 }
 
 function getOrCreateDeviceId() {
-  let value = localStorage.getItem(STORAGE_DEVICE_ID)
+  let value = safeStorageGet(STORAGE_DEVICE_ID)
   if (!value) {
     value = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
-    localStorage.setItem(STORAGE_DEVICE_ID, value)
+    safeStorageSet(STORAGE_DEVICE_ID, value)
   }
   return value
+}
+
+function safeStorageGet(key) {
+  try {
+    return localStorage.getItem(key) || ''
+  } catch {
+    return ''
+  }
+}
+
+function safeStorageSet(key, value) {
+  try {
+    localStorage.setItem(key, String(value))
+  } catch {
+    // Ignore storage failures so the app can still render and function.
+  }
 }
 
 function defaultDeviceName() {
