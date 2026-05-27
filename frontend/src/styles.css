@@ -230,6 +230,20 @@ button:disabled {
   place-items: center;
 }
 
+.conversation-delete {
+  flex: 0 0 auto;
+  align-self: start;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--danger);
+  display: grid;
+  place-items: center;
+}
+
 .conversation-select small {
   color: var(--muted-3);
 }
@@ -237,6 +251,11 @@ button:disabled {
 .conversation-pencil:hover {
   background: var(--primary-soft);
   border-color: var(--primary-border);
+}
+
+.conversation-delete:hover {
+  background: var(--error-bg);
+  border-color: var(--error-border);
 }
 
 .topbar-title-action {

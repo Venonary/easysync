@@ -426,13 +426,30 @@ async function deleteMessage(message) {
 }
 
 async function createConversation() {
+  const title = nextConversationTitle()
   const response = await fetch('/api/conversations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: `会话 ${state.conversations.length + 1}` })
+    body: JSON.stringify({ title })
   })
   const conversation = await response.json()
   activeConversationId.value = conversation.id
+}
+
+function nextConversationTitle() {
+  const usedNumbers = new Set()
+  for (const conversation of state.conversations) {
+    const match = /^会话\s*(\d+)$/.exec(conversation.title)
+    if (match) {
+      usedNumbers.add(Number(match[1]))
+    }
+  }
+
+  let index = 1
+  while (usedNumbers.has(index)) {
+    index += 1
+  }
+  return `会话 ${index}`
 }
 
 async function renameConversation(conversation) {
@@ -540,6 +557,15 @@ function isImageMessage(message) {
                 @click.stop="renameConversation(conversation)"
               >
                 ✎
+              </button>
+              <button
+                class="conversation-delete"
+                type="button"
+                :aria-label="`删除 ${conversation.title}`"
+                title="删除会话"
+                @click.stop="deleteConversation(conversation)"
+              >
+                ×
               </button>
             </span>
             <small>{{ formatTime(conversation.updatedAt) }}</small>
