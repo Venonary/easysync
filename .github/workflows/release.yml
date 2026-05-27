@@ -20,7 +20,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,55 +37,74 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             arch: amd64
-            ext: ''
+            ext: ""
           - os: ubuntu-latest
             goos: linux
             arch: arm64
-            ext: ''
+            ext: ""
           - os: macos-latest
             goos: darwin
             arch: amd64
-            ext: ''
+            ext: ""
           - os: macos-latest
             goos: darwin
             arch: arm64
-            ext: ''
+            ext: ""
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
-          
+          node-version: '24'
+
       - name: Build frontend
         run: |
           npm --prefix frontend ci
           npm --prefix frontend run build
-          
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
-          
-      - name: Build backend (with embedded frontend)
+          go-version: '1.24.x'
+
+      - name: Build embedded binary
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
         run: |
-          mkdir -p build
-          # Windows requires bash shell step below, or we just write a simple script
-          BIN_NAME="easysync-${{ github.event.inputs.tag }}-${{ matrix.goos }}-${{ matrix.arch }}${{ matrix.ext }}"
-          go build -o "build/$BIN_NAME" .
-        shell: bash
-          
-      - name: Upload Release Asset
+          mkdir -p release
+          BIN_NAME="easysync-${{ matrix.goos }}-${{ matrix.arch }}${{ matrix.ext }}"
+          go build -trimpath -ldflags='-s -w' -o "release/${BIN_NAME}" .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ github.event.inputs.tag }}
           name: ${{ github.event.inputs.name || github.event.inputs.tag }}
           body: ${{ github.event.inputs.body || '' }}
-          files: build/*
+          files: dist/*
           draft: false
           prerelease: false
-          token: ${{ secrets.GITHUB_TOKEN }}
