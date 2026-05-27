@@ -60,7 +60,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          npm --prefix frontend ci
+          npm --prefix frontend install
           npm --prefix frontend run build
 
       - name: Setup Go
