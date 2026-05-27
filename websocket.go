@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -62,19 +63,40 @@ func websocketAccept(key string) string {
 }
 
 func (c *WSConn) ReadText() ([]byte, error) {
+	var message bytes.Buffer
+	readingFragmentedMessage := false
+
 	for {
-		opcode, payload, err := c.readFrame()
+		fin, opcode, payload, err := c.readFrame()
 		if err != nil {
 			return nil, err
 		}
 		switch opcode {
 		case 0x1:
-			return payload, nil
+			if fin {
+				return payload, nil
+			}
+			message.Reset()
+			message.Write(payload)
+			readingFragmentedMessage = true
+		case 0x0:
+			if !readingFragmentedMessage {
+				return nil, errors.New("unexpected continuation frame")
+			}
+			message.Write(payload)
+			if fin {
+				data := append([]byte(nil), message.Bytes()...)
+				message.Reset()
+				readingFragmentedMessage = false
+				return data, nil
+			}
 		case 0x8:
 			_ = c.Close()
 			return nil, io.EOF
 		case 0x9:
 			_ = c.writeFrame(0xA, payload)
+		default:
+			continue
 		}
 	}
 }
@@ -89,49 +111,51 @@ func (c *WSConn) Close() error {
 	return c.conn.Close()
 }
 
-func (c *WSConn) readFrame() (byte, []byte, error) {
+func (c *WSConn) readFrame() (bool, byte, []byte, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(c.r, header); err != nil {
-		return 0, nil, err
+		return false, 0, nil, err
 	}
 
+	fin := header[0]&0x80 != 0
 	opcode := header[0] & 0x0F
 	masked := header[1]&0x80 != 0
 	length := uint64(header[1] & 0x7F)
 	if length == 126 {
 		extended := make([]byte, 2)
 		if _, err := io.ReadFull(c.r, extended); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(extended))
 	} else if length == 127 {
 		extended := make([]byte, 8)
 		if _, err := io.ReadFull(c.r, extended); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(extended)
 	}
-	if length > 1<<20 {
-		return 0, nil, errors.New("websocket frame exceeds 1MiB")
+	const maxFrameSize = 16 << 20
+	if length > maxFrameSize {
+		return false, 0, nil, errors.New("websocket frame exceeds 16MiB")
 	}
 
 	var mask [4]byte
 	if masked {
 		if _, err := io.ReadFull(c.r, mask[:]); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 	}
 
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(c.r, payload); err != nil {
-		return 0, nil, err
+		return false, 0, nil, err
 	}
 	if masked {
 		for i := range payload {
 			payload[i] ^= mask[i%4]
 		}
 	}
-	return opcode, payload, nil
+	return fin, opcode, payload, nil
 }
 
 func (c *WSConn) writeFrame(opcode byte, payload []byte) error {

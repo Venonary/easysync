@@ -4,6 +4,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 const STORAGE_DEVICE_ID = 'easysync.deviceId'
 const STORAGE_DEVICE_NAME = 'easysync.deviceName'
 const STORAGE_ACTIVE_CONVERSATION = 'easysync.activeConversationId'
+const STORAGE_THEME = 'easysync.theme'
+
+const themeOptions = [
+  { value: 'light', label: '浅色主题' },
+  { value: 'dark', label: '深色主题' },
+  { value: 'system', label: '跟随系统' }
+]
 
 const state = reactive({
   conversations: [],
@@ -17,10 +24,24 @@ const text = ref('')
 const activeConversationId = ref(localStorage.getItem(STORAGE_ACTIVE_CONVERSATION) || '')
 const deviceId = getOrCreateDeviceId()
 const deviceName = ref(localStorage.getItem(STORAGE_DEVICE_NAME) || defaultDeviceName())
+const themeMode = ref(localStorage.getItem(STORAGE_THEME) || 'system')
+const systemPrefersDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches)
 const socket = ref(null)
 const messageList = ref(null)
 const editingMessageId = ref('')
 const editingText = ref('')
+const imagePasteHint = ref('复制图片后直接粘贴即可发送')
+const globalPasteHandler = (event) => {
+  const target = event.target
+  const tagName = target?.tagName?.toLowerCase()
+  if (tagName === 'textarea' || tagName === 'input') return
+  handlePaste(event)
+}
+let mediaQueryList = null
+
+const handleSystemThemeChange = (event) => {
+  systemPrefersDark.value = event.matches
+}
 
 const activeConversation = computed(() => {
   return state.conversations.find((item) => item.id === activeConversationId.value) || state.conversations[0]
@@ -41,6 +62,17 @@ const groupedPresence = computed(() => {
   return [...seen.values()]
 })
 
+const effectiveTheme = computed(() => {
+  if (themeMode.value === 'system') {
+    return systemPrefersDark.value ? 'dark' : 'light'
+  }
+  return themeMode.value
+})
+
+const canCopyImage = computed(() => {
+  return Boolean(window.isSecureContext && navigator.clipboard?.write && typeof ClipboardItem !== 'undefined')
+})
+
 watch(deviceName, (value) => {
   localStorage.setItem(STORAGE_DEVICE_NAME, value.trim() || defaultDeviceName())
 })
@@ -48,6 +80,15 @@ watch(deviceName, (value) => {
 watch(activeConversationId, (value) => {
   if (value) localStorage.setItem(STORAGE_ACTIVE_CONVERSATION, value)
 })
+
+watch(themeMode, (value) => {
+  localStorage.setItem(STORAGE_THEME, value)
+})
+
+watch(effectiveTheme, (value) => {
+  document.documentElement.dataset.theme = value
+  document.documentElement.style.colorScheme = value
+}, { immediate: true })
 
 watch(visibleMessages, async () => {
   await nextTick()
@@ -57,11 +98,27 @@ watch(visibleMessages, async () => {
 })
 
 onMounted(async () => {
+  mediaQueryList = window.matchMedia('(prefers-color-scheme: dark)')
+  systemPrefersDark.value = mediaQueryList.matches
+  if (mediaQueryList.addEventListener) {
+    mediaQueryList.addEventListener('change', handleSystemThemeChange)
+  } else if (mediaQueryList.addListener) {
+    mediaQueryList.addListener(handleSystemThemeChange)
+  }
+  window.addEventListener('paste', globalPasteHandler)
   await loadState()
   connect()
 })
 
 onBeforeUnmount(() => {
+  if (mediaQueryList) {
+    if (mediaQueryList.removeEventListener) {
+      mediaQueryList.removeEventListener('change', handleSystemThemeChange)
+    } else if (mediaQueryList.removeListener) {
+      mediaQueryList.removeListener(handleSystemThemeChange)
+    }
+  }
+  window.removeEventListener('paste', globalPasteHandler)
   socket.value?.close()
 })
 
@@ -164,6 +221,70 @@ function sendMessage() {
   text.value = ''
 }
 
+async function sendImageMessage(content) {
+  if (!content || !activeConversation.value || socket.value?.readyState !== WebSocket.OPEN) return
+  socket.value.send(JSON.stringify({
+    type: 'send_message',
+    conversationId: activeConversation.value.id,
+    messageType: 'image',
+    content,
+    deviceId,
+    deviceName: deviceName.value,
+    deviceType: platformName()
+  }))
+}
+
+async function handlePaste(event) {
+  const clipboardData = event.clipboardData
+  const file = pickImageFile(clipboardData)
+  if (!file) {
+    const clipboardTypes = Array.from(clipboardData?.types || [])
+    if (clipboardTypes.some((item) => item === 'Files' || item.startsWith('image/'))) {
+      state.error = '检测到剪贴板内容，但未能读取图片文件'
+    }
+    return
+  }
+
+  event.preventDefault()
+  if (socket.value?.readyState !== WebSocket.OPEN || !activeConversation.value) {
+    state.error = '当前未连接到服务端，无法发送图片'
+    return
+  }
+
+  try {
+    const dataUrl = await fileToDataUrl(file)
+    await sendImageMessage(dataUrl)
+    imagePasteHint.value = '图片已发送'
+    state.error = ''
+  } catch (err) {
+    state.error = '图片读取或发送失败，请尝试更小的图片'
+    imagePasteHint.value = '图片发送失败'
+  }
+}
+
+function pickImageFile(clipboardData) {
+  const item = Array.from(clipboardData?.items || []).find((entry) => entry.type.startsWith('image/'))
+  if (item) {
+    return item.getAsFile()
+  }
+
+  const file = Array.from(clipboardData?.files || []).find((entry) => entry.type.startsWith('image/'))
+  if (file) {
+    return file
+  }
+
+  return null
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('failed to read file'))
+    reader.readAsDataURL(file)
+  })
+}
+
 async function pasteAndSend() {
   if (!navigator.clipboard?.readText) {
     state.error = '当前浏览器不支持直接读取剪贴板，请手动粘贴'
@@ -181,9 +302,88 @@ async function pasteAndSend() {
 async function copyMessage(content) {
   try {
     await navigator.clipboard.writeText(content)
+    state.error = ''
   } catch {
+    if (fallbackCopyText(content)) {
+      state.error = ''
+      return
+    }
     state.error = '复制失败，请手动选择文本复制'
   }
+}
+
+function fallbackCopyText(content) {
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = content
+    textarea.setAttribute('readonly', 'true')
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    textarea.style.top = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const success = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return success
+  } catch {
+    return false
+  }
+}
+
+async function copyImageMessage(message) {
+  try {
+    const blob = await dataUrlToBlob(message.content)
+    const copied = await tryCopyBlobAsImage(blob)
+    if (copied) {
+      state.error = ''
+      imagePasteHint.value = '图片已复制到剪贴板'
+      return
+    }
+  }
+
+  catch {
+    // fall through to the visible error below
+  }
+
+  state.error = '当前环境不支持直接复制图片，请使用保存按钮'
+  imagePasteHint.value = '图片复制失败'
+}
+
+async function saveImageMessage(message) {
+  const blob = await dataUrlToBlob(message.content)
+  const fileName = `easysync-${message.id || Date.now()}.png`
+  saveBlob(blob, fileName)
+  state.error = ''
+  imagePasteHint.value = '图片已保存'
+}
+
+async function tryCopyBlobAsImage(blob) {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+    return false
+  }
+
+  try {
+    await navigator.clipboard.write([
+      new ClipboardItem({ [blob.type || 'image/png']: blob })
+    ])
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function dataUrlToBlob(dataUrl) {
+  const response = await fetch(dataUrl)
+  return await response.blob()
+}
+
+function saveBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 function startEditMessage(message) {
@@ -301,6 +501,10 @@ function isEdited(message) {
   if (!message.updatedAt || !message.createdAt) return false
   return new Date(message.updatedAt).getTime() > new Date(message.createdAt).getTime()
 }
+
+function isImageMessage(message) {
+  return message.type === 'image' || /^data:image\//.test(message.content || '')
+}
 </script>
 
 <template>
@@ -319,23 +523,46 @@ function isEdited(message) {
       <button class="primary-action" @click="createConversation">新建会话</button>
 
       <nav class="conversation-list">
-        <button
+        <div
           v-for="conversation in state.conversations"
           :key="conversation.id"
           class="conversation-item"
           :class="{ active: activeConversationId === conversation.id }"
-          @click="activeConversationId = conversation.id"
         >
-          <span>{{ conversation.title }}</span>
-          <small>{{ formatTime(conversation.updatedAt) }}</small>
-        </button>
+          <div class="conversation-select" @click="activeConversationId = conversation.id">
+            <span class="conversation-title-row">
+              <span class="conversation-title">{{ conversation.title }}</span>
+              <button
+                class="conversation-pencil"
+                type="button"
+                :aria-label="`重命名 ${conversation.title}`"
+                title="重命名会话"
+                @click.stop="renameConversation(conversation)"
+              >
+                ✎
+              </button>
+            </span>
+            <small>{{ formatTime(conversation.updatedAt) }}</small>
+          </div>
+        </div>
       </nav>
     </aside>
 
     <section class="workspace">
       <header class="topbar">
         <div>
-          <h2>{{ activeConversation?.title || '暂无会话' }}</h2>
+          <button
+            v-if="activeConversation"
+            class="topbar-title-action"
+            type="button"
+            @click="renameConversation(activeConversation)"
+            :aria-label="`重命名 ${activeConversation.title}`"
+            title="点击标题改名"
+          >
+            <h2>{{ activeConversation.title }}</h2>
+            <span class="topbar-pencil" aria-hidden="true">✎</span>
+          </button>
+          <h2 v-else>暂无会话</h2>
           <p>{{ visibleMessages.length }} 条消息</p>
         </div>
         <div class="topbar-actions" v-if="activeConversation">
@@ -368,9 +595,14 @@ function isEdited(message) {
             </div>
           </template>
           <template v-else>
-            <p>{{ message.content }}</p>
+            <img v-if="isImageMessage(message)" :src="message.content" class="message-image" alt="粘贴的图片" />
+            <p v-else>{{ message.content }}</p>
             <div class="message-actions">
-              <button class="copy" @click="copyMessage(message.content)">复制</button>
+              <template v-if="isImageMessage(message)">
+                <button v-if="canCopyImage" class="copy" @click="copyImageMessage(message)">复制图片</button>
+                <button class="copy" @click="saveImageMessage(message)">保存图片</button>
+              </template>
+              <button v-else class="copy" @click="copyMessage(message.content)">复制</button>
               <button v-if="isMine(message)" @click="startEditMessage(message)">编辑</button>
               <button class="danger" @click="deleteMessage(message)">删除</button>
             </div>
@@ -383,11 +615,13 @@ function isEdited(message) {
           v-model="text"
           placeholder="输入文本，Ctrl/⌘ + Enter 发送"
           @keydown="onTextareaKeydown"
+          @paste="handlePaste"
         />
         <div class="composer-actions">
           <button @click="pasteAndSend">粘贴并发送</button>
           <button class="send" :disabled="!text.trim() || !state.connected" @click="sendMessage">发送</button>
         </div>
+        <p class="muted composer-hint">{{ imagePasteHint }}</p>
       </footer>
     </section>
 
@@ -399,6 +633,19 @@ function isEdited(message) {
           <input v-model="deviceName" />
         </label>
         <p class="muted">{{ platformName() }} · {{ deviceId.slice(0, 8) }}</p>
+      </section>
+
+      <section>
+        <h3>视觉主题</h3>
+        <label>
+          <span>主题模式</span>
+          <select v-model="themeMode">
+            <option v-for="option in themeOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+        <p class="muted">当前：{{ effectiveTheme === 'dark' ? '深色' : '浅色' }}</p>
       </section>
 
       <section>
