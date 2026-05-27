@@ -1,0 +1,6 @@
+.gocache/
+data/
+frontend/dist/
+frontend/node_modules/
+frontend/package-lock.json
+easysync.exe
