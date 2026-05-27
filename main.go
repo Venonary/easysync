@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-//go:embed frontend/dist
+//go:embed all:frontend/dist
 var frontendFS embed.FS
 
 // main 是程序入口。它解析命令行参数，初始化数据存储和 Hub，

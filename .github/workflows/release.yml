@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write # Needed for GitHub Releases
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-and-release:
     runs-on: ${{ matrix.os }}
@@ -78,8 +81,6 @@ jobs:
           
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.event.inputs.tag }}
           name: ${{ github.event.inputs.name || github.event.inputs.tag }}
@@ -87,3 +88,4 @@ jobs:
           files: build/*
           draft: false
           prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
