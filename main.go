@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -324,10 +325,9 @@ func spaHandler() http.HandlerFunc {
 		log.Fatal(err)
 	}
 	fileServer := http.FileServer(http.FS(dist))
-	
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		cleanPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), string(filepath.Separator))
-		cleanPath = strings.TrimPrefix(cleanPath, "/")
+		cleanPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 
 		// 检查嵌入文件系统中是否存在该路径
 		if f, err := dist.Open(cleanPath); err == nil {
@@ -338,7 +338,7 @@ func spaHandler() http.HandlerFunc {
 			}
 			f.Close()
 		}
-		
+
 		// 否则，让 FileServer 处理 "/" 即相当于返回 index.html
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
