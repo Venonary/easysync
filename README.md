@@ -8,8 +8,6 @@ EasySync 是一个局域网文本同步工具。一台 Windows、Linux 或 macOS
 
 如果你只是想直接使用，请到 GitHub Release 下载对应平台的发布包：
 
-https://github.com/<你的用户名>/<你的仓库>/releases
-
 [Release链接](https://github.com/Venonary/easysync/releases)
 
 Release 包里已经包含后端可执行文件和嵌入好的前端页面，不需要另外准备 `dist` 目录。
