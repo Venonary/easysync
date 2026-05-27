@@ -1,25 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"bytes"
+	"embed"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"math/big"
+	"io/fs"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 	"strings"
+	"time"
 )
+
+//go:embed frontend/dist
+var frontendFS embed.FS
 
 // main 是程序入口。它解析命令行参数，初始化数据存储和 Hub，
 // 并注册一组 HTTP 路由：用于健康检查、读取状态、会话管理、消息管理、
@@ -27,7 +32,6 @@ import (
 func main() {
 	addr := flag.String("addr", ":7788", "HTTP listen address")
 	dataDir := flag.String("data", "data", "data directory")
-	frontendDir := flag.String("frontend", filepath.Join("frontend", "dist"), "built frontend directory")
 	useHTTPS := flag.Bool("https", false, "enable HTTPS with a self-signed certificate")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file")
 	tlsKey := flag.String("tls-key", "", "TLS private key file")
@@ -50,9 +54,9 @@ func main() {
 	mux.HandleFunc("/api/conversations/", conversationHandler(store, hub))
 	mux.HandleFunc("/api/messages/", messageHandler(store, hub))
 	mux.HandleFunc("/ws", hub.ServeWS)
-	mux.Handle("/", spaHandler(*frontendDir))
+	mux.Handle("/", spaHandler())
 
-	printStartup(*addr, *frontendDir, *dataDir, *useHTTPS)
+	printStartup(*addr, *dataDir, *useHTTPS)
 	if *useHTTPS {
 		certFile, keyFile, err := ensureTLSFiles(*dataDir, *tlsCert, *tlsKey)
 		if err != nil {
@@ -312,27 +316,32 @@ func writeJSON(w http.ResponseWriter, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func spaHandler(dir string) http.HandlerFunc {
-	// spaHandler 用于托管前端单页应用（SPA）。
-	// 它会尝试直接返回静态资源（当请求的路径对应真实文件时），
-	// 否则返回 `index.html` 以让前端路由接管。若前端未构建，会返回 404 并提示构建命令。
-	fileServer := http.FileServer(http.Dir(dir))
+func spaHandler() http.HandlerFunc {
+	// spaHandler 用于托管嵌入在二进制内的前端单页应用（SPA）。
+	// 它会尝试直接返回静态资源，否则返回 `index.html` 以让前端路由接管。
+	dist, err := fs.Sub(frontendFS, "frontend/dist")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fileServer := http.FileServer(http.FS(dist))
+	
 	return func(w http.ResponseWriter, r *http.Request) {
 		cleanPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), string(filepath.Separator))
 		cleanPath = strings.TrimPrefix(cleanPath, "/")
-		path := filepath.Join(dir, cleanPath)
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			// 请求静态文件，直接返回
-			fileServer.ServeHTTP(w, r)
-			return
+
+		// 检查嵌入文件系统中是否存在该路径
+		if f, err := dist.Open(cleanPath); err == nil {
+			if stat, err := f.Stat(); err == nil && !stat.IsDir() {
+				f.Close()
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+			f.Close()
 		}
-		// 否则返回 index.html 让前端路由处理
-		index := filepath.Join(dir, "index.html")
-		if _, err := os.Stat(index); err != nil {
-			http.Error(w, "frontend is not built; run npm.cmd --prefix frontend run build", http.StatusNotFound)
-			return
-		}
-		http.ServeFile(w, r, index)
+		
+		// 否则，让 FileServer 处理 "/" 即相当于返回 index.html
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
 	}
 }
 
@@ -344,7 +353,7 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
-func printStartup(addr, frontendDir, dataDir string, useHTTPS bool) {
+func printStartup(addr, dataDir string, useHTTPS bool) {
 	// printStartup 在服务启动时打印本机与局域网可访问的地址，
 	// 以及前端构建目录和数据目录位置，便于用户在终端查看。
 	port := addr
@@ -361,7 +370,7 @@ func printStartup(addr, frontendDir, dataDir string, useHTTPS bool) {
 	for _, ip := range lanIPv4s() {
 		fmt.Printf("  LAN:      %s://%s:%s\n", scheme, ip, port)
 	}
-	fmt.Printf("  Frontend: %s\n", frontendDir)
+	fmt.Printf("  Frontend: Embedded\n")
 	fmt.Printf("  Data:     %s\n", dataDir)
 }
 
