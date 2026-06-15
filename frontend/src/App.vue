@@ -28,9 +28,12 @@ const themeMode = ref(safeStorageGet(STORAGE_THEME) || 'system')
 const systemPrefersDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches)
 const socket = ref(null)
 const messageList = ref(null)
+const imageInput = ref(null)
+const fileInput = ref(null)
 const editingMessageId = ref('')
 const editingText = ref('')
-const imagePasteHint = ref('复制图片后直接粘贴即可发送')
+const uploadHint = ref('可粘贴图片，或从文件/相册中选择上传')
+const uploading = ref(false)
 const globalPasteHandler = (event) => {
   const target = event.target
   const tagName = target?.tagName?.toLowerCase()
@@ -221,19 +224,6 @@ function sendMessage() {
   text.value = ''
 }
 
-async function sendImageMessage(content) {
-  if (!content || !activeConversation.value || socket.value?.readyState !== WebSocket.OPEN) return
-  socket.value.send(JSON.stringify({
-    type: 'send_message',
-    conversationId: activeConversation.value.id,
-    messageType: 'image',
-    content,
-    deviceId,
-    deviceName: deviceName.value,
-    deviceType: platformName()
-  }))
-}
-
 async function handlePaste(event) {
   const clipboardData = event.clipboardData
   const file = pickImageFile(clipboardData)
@@ -252,13 +242,12 @@ async function handlePaste(event) {
   }
 
   try {
-    const dataUrl = await fileToDataUrl(file)
-    await sendImageMessage(dataUrl)
-    imagePasteHint.value = '图片已发送'
+    await uploadFile(file)
+    uploadHint.value = '图片已发送'
     state.error = ''
   } catch (err) {
-    state.error = '图片读取或发送失败，请尝试更小的图片'
-    imagePasteHint.value = '图片发送失败'
+    state.error = '图片上传失败，请尝试更小的图片'
+    uploadHint.value = '图片发送失败'
   }
 }
 
@@ -276,13 +265,50 @@ function pickImageFile(clipboardData) {
   return null
 }
 
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result || ''))
-    reader.onerror = () => reject(reader.error || new Error('failed to read file'))
-    reader.readAsDataURL(file)
-  })
+function chooseFile() {
+  fileInput.value?.click()
+}
+
+function chooseImage() {
+  imageInput.value?.click()
+}
+
+async function handleFileSelected(event) {
+  const files = Array.from(event.target.files || [])
+  event.target.value = ''
+  for (const file of files) {
+    await uploadFile(file)
+  }
+}
+
+async function uploadFile(file) {
+  if (!file || !activeConversation.value) return
+  const formData = new FormData()
+  formData.append('conversationId', activeConversation.value.id)
+  formData.append('deviceId', deviceId)
+  formData.append('deviceName', deviceName.value)
+  formData.append('deviceType', platformName())
+  formData.append('messageType', file.type.startsWith('image/') ? 'image' : 'file')
+  formData.append('file', file)
+
+  uploading.value = true
+  uploadHint.value = `正在上传 ${file.name || '文件'}`
+  try {
+    const response = await fetch('/api/uploads', {
+      method: 'POST',
+      body: formData
+    })
+    if (!response.ok) {
+      throw new Error(await response.text())
+    }
+    state.error = ''
+    uploadHint.value = `${file.name || '文件'} 已上传`
+  } catch (err) {
+    state.error = err?.message || '文件上传失败'
+    uploadHint.value = '文件上传失败'
+  } finally {
+    uploading.value = false
+  }
 }
 
 async function pasteAndSend() {
@@ -332,11 +358,11 @@ function fallbackCopyText(content) {
 
 async function copyImageMessage(message) {
   try {
-    const blob = await dataUrlToBlob(message.content)
+    const blob = await fetchAttachmentBlob(message)
     const copied = await tryCopyBlobAsImage(blob)
     if (copied) {
       state.error = ''
-      imagePasteHint.value = '图片已复制到剪贴板'
+      uploadHint.value = '图片已复制到剪贴板'
       return
     }
   }
@@ -346,15 +372,15 @@ async function copyImageMessage(message) {
   }
 
   state.error = '当前环境不支持直接复制图片，请使用保存按钮'
-  imagePasteHint.value = '图片复制失败'
+  uploadHint.value = '图片复制失败'
 }
 
 async function saveImageMessage(message) {
-  const blob = await dataUrlToBlob(message.content)
-  const fileName = `easysync-${message.id || Date.now()}.png`
+  const blob = await fetchAttachmentBlob(message)
+  const fileName = attachmentName(message) || `easysync-${message.id || Date.now()}.png`
   saveBlob(blob, fileName)
   state.error = ''
-  imagePasteHint.value = '图片已保存'
+  uploadHint.value = '图片已保存'
 }
 
 async function tryCopyBlobAsImage(blob) {
@@ -372,8 +398,8 @@ async function tryCopyBlobAsImage(blob) {
   }
 }
 
-async function dataUrlToBlob(dataUrl) {
-  const response = await fetch(dataUrl)
+async function fetchAttachmentBlob(message) {
+  const response = await fetch(attachmentUrl(message))
   return await response.blob()
 }
 
@@ -536,7 +562,31 @@ function isEdited(message) {
 }
 
 function isImageMessage(message) {
-  return message.type === 'image' || /^data:image\//.test(message.content || '')
+  return message.type === 'image' || /^data:image\//.test(message.content || '') || (message.attachment?.mimeType || '').startsWith('image/')
+}
+
+function isFileMessage(message) {
+  return message.type === 'file' || Boolean(message.attachment)
+}
+
+function attachmentUrl(message) {
+  return message.attachment?.url || message.content || ''
+}
+
+function attachmentName(message) {
+  return message.attachment?.name || message.content || '文件'
+}
+
+function formatFileSize(size) {
+  if (!size) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = Number(size)
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
 }
 </script>
 
@@ -637,15 +687,26 @@ function isImageMessage(message) {
             </div>
           </template>
           <template v-else>
-            <img v-if="isImageMessage(message)" :src="message.content" class="message-image" alt="粘贴的图片" />
+            <img v-if="isImageMessage(message)" :src="attachmentUrl(message)" class="message-image" :alt="attachmentName(message)" />
+            <a v-else-if="isFileMessage(message)" class="file-card" :href="attachmentUrl(message)" :download="attachmentName(message)">
+              <span class="file-icon" aria-hidden="true">⬇</span>
+              <span class="file-info">
+                <strong>{{ attachmentName(message) }}</strong>
+                <small>{{ message.attachment?.mimeType || '文件' }} {{ formatFileSize(message.attachment?.size) }}</small>
+              </span>
+            </a>
             <p v-else>{{ message.content }}</p>
             <div class="message-actions">
               <template v-if="isImageMessage(message)">
                 <button v-if="canCopyImage" class="copy" @click="copyImageMessage(message)">复制图片</button>
                 <button class="copy" @click="saveImageMessage(message)">保存图片</button>
+                <a class="button-link" :href="attachmentUrl(message)" :download="attachmentName(message)">下载</a>
+              </template>
+              <template v-else-if="isFileMessage(message)">
+                <a class="button-link" :href="attachmentUrl(message)" :download="attachmentName(message)">下载</a>
               </template>
               <button v-else class="copy" @click="copyMessage(message.content)">复制</button>
-              <button v-if="isMine(message)" @click="startEditMessage(message)">编辑</button>
+              <button v-if="isMine(message) && message.type === 'text'" @click="startEditMessage(message)">编辑</button>
               <button class="danger" @click="deleteMessage(message)">删除</button>
             </div>
           </template>
@@ -660,10 +721,18 @@ function isImageMessage(message) {
           @paste="handlePaste"
         />
         <div class="composer-actions">
+          <input ref="imageInput" class="file-input" type="file" multiple accept="image/*" @change="handleFileSelected" />
+          <input ref="fileInput" class="file-input" type="file" multiple @change="handleFileSelected" />
+          <button :disabled="uploading || !activeConversation" @click="chooseImage">
+            {{ uploading ? '上传中' : '上传图片' }}
+          </button>
+          <button :disabled="uploading || !activeConversation" @click="chooseFile">
+            {{ uploading ? '上传中' : '上传文件' }}
+          </button>
           <button @click="pasteAndSend">粘贴并发送</button>
           <button class="send" :disabled="!text.trim() || !state.connected" @click="sendMessage">发送</button>
         </div>
-        <p class="muted composer-hint">{{ imagePasteHint }}</p>
+        <p class="muted composer-hint">{{ uploadHint }}</p>
       </footer>
     </section>
 

@@ -54,7 +54,7 @@ func TestStoreConversationAndMessageFlow(t *testing.T) {
 		t.Fatal("expected permission denied for non-owner update")
 	}
 
-	if err := store.DeleteMessage(message.ID); err != nil {
+	if _, err := store.DeleteMessage(message.ID); err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range store.State().Messages {
@@ -79,5 +79,43 @@ func TestStoreConversationAndMessageFlow(t *testing.T) {
 		if item.ConversationID == conversation.ID {
 			t.Fatal("messages for deleted conversation should be removed")
 		}
+	}
+}
+
+func TestStoreFileMessageFlow(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conversation := store.State().Conversations[0]
+	message, err := store.AddMessage(Message{
+		ConversationID: conversation.ID,
+		DeviceID:       "device-1",
+		DeviceName:     "iPhone",
+		DeviceType:     "iOS",
+		Type:           "image",
+		Content:        "photo.jpg",
+		Attachment: &Attachment{
+			URL:        "/uploads/photo.jpg",
+			Name:       "photo.jpg",
+			StoredName: "stored-photo.jpg",
+			MimeType:   "image/jpeg",
+			Size:       2048,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Attachment == nil || message.Attachment.Name != "photo.jpg" {
+		t.Fatalf("attachment was not persisted: %#v", message)
+	}
+
+	deleted, err := store.DeleteMessage(message.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Attachment == nil || deleted.Attachment.StoredName != "stored-photo.jpg" {
+		t.Fatalf("deleted message should include attachment metadata: %#v", deleted)
 	}
 }

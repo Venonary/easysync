@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math/big"
@@ -26,6 +27,8 @@ import (
 
 //go:embed all:frontend/dist
 var frontendFS embed.FS
+
+const maxUploadBytes = 256 << 20
 
 // main 是程序入口。它解析命令行参数，初始化数据存储和 Hub，
 // 并注册一组 HTTP 路由：用于健康检查、读取状态、会话管理、消息管理、
@@ -54,6 +57,8 @@ func main() {
 	mux.HandleFunc("/api/conversations", conversationsHandler(store, hub))
 	mux.HandleFunc("/api/conversations/", conversationHandler(store, hub))
 	mux.HandleFunc("/api/messages/", messageHandler(store, hub))
+	mux.HandleFunc("/api/uploads", uploadHandler(store, hub))
+	mux.HandleFunc("/uploads/", serveUploadHandler(*dataDir))
 	mux.HandleFunc("/ws", hub.ServeWS)
 	mux.Handle("/", spaHandler())
 
@@ -128,13 +133,13 @@ func generateSelfSignedCert(certFile, keyFile string) error {
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
-		Subject: pkix.Name{CommonName: "EasySync"},
-		NotBefore: time.Now().Add(-time.Hour),
-		NotAfter:  time.Now().AddDate(1, 0, 0),
-		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames: []string{"localhost"},
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		Subject:      pkix.Name{CommonName: "EasySync"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 
 	ifaces, err := net.Interfaces()
@@ -220,9 +225,13 @@ func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
 			hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
 			writeJSON(w, message)
 		case http.MethodDelete:
-			if err := store.DeleteMessage(id); err != nil {
+			message, err := store.DeleteMessage(id)
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
+			}
+			if message.Attachment != nil {
+				_ = os.Remove(filepath.Join(uploadRootFromStore(store), "uploads", message.Attachment.StoredName))
 			}
 			hub.broadcast(ServerEvent{
 				Type: "message_deleted",
@@ -235,6 +244,106 @@ func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}
+}
+
+func uploadHandler(store *Store, hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			http.Error(w, "invalid multipart form or file too large", http.StatusBadRequest)
+			return
+		}
+
+		conversationID := r.FormValue("conversationId")
+		deviceID := r.FormValue("deviceId")
+		deviceName := r.FormValue("deviceName")
+		deviceType := r.FormValue("deviceType")
+		messageType := normalizeMessageType(r.FormValue("messageType"))
+		if messageType != "image" {
+			messageType = "file"
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "file is required", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		uploadDir := filepath.Join(uploadRootFromStore(store), "uploads")
+		if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		storedName := fmt.Sprintf("%s%s", newID(), filepath.Ext(header.Filename))
+		storedPath := filepath.Join(uploadDir, storedName)
+		dst, err := os.Create(storedPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		written, copyErr := io.Copy(dst, file)
+		closeErr := dst.Close()
+		if copyErr != nil {
+			_ = os.Remove(storedPath)
+			http.Error(w, copyErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if closeErr != nil {
+			_ = os.Remove(storedPath)
+			http.Error(w, closeErr.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		url := "/uploads/" + storedName
+		attachment := &Attachment{
+			URL:        url,
+			Name:       header.Filename,
+			StoredName: storedName,
+			MimeType:   header.Header.Get("Content-Type"),
+			Size:       written,
+		}
+		if messageType == "image" {
+			attachment.URL = url
+		}
+
+		message, err := store.AddMessage(Message{
+			ConversationID: conversationID,
+			DeviceID:       deviceID,
+			DeviceName:     deviceName,
+			DeviceType:     deviceType,
+			Type:           messageType,
+			Content:        header.Filename,
+			Attachment:     attachment,
+		})
+		if err != nil {
+			_ = os.Remove(storedPath)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		hub.broadcast(ServerEvent{Type: "message", Data: message})
+		hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
+		writeJSON(w, message)
+	}
+}
+
+func serveUploadHandler(dataDir string) http.HandlerFunc {
+	root := filepath.Join(dataDir, "uploads")
+	fileServer := http.StripPrefix("/uploads/", http.FileServer(http.Dir(root)))
+	return func(w http.ResponseWriter, r *http.Request) {
+		fileServer.ServeHTTP(w, r)
+	}
+}
+
+func uploadRootFromStore(store *Store) string {
+	return filepath.Dir(store.path)
 }
 
 func conversationsHandler(store *Store, hub *Hub) http.HandlerFunc {

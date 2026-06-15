@@ -157,8 +157,14 @@ func (s *Store) AddMessage(message Message) (Message, error) {
 	message.Content = strings.TrimSpace(message.Content)
 	message.CreatedAt = time.Now()
 	message.UpdatedAt = message.CreatedAt
-	if message.Content == "" {
+	if message.Content == "" && message.Attachment == nil {
 		return Message{}, errors.New("message content is required")
+	}
+	if message.Type == "file" && message.Attachment == nil {
+		return Message{}, errors.New("file attachment is required")
+	}
+	if message.Type == "image" && message.Attachment == nil && message.Content == "" {
+		return Message{}, errors.New("image content is required")
 	}
 
 	s.Messages = append(s.Messages, message)
@@ -198,7 +204,7 @@ func (s *Store) UpdateMessage(id, deviceID, content string) (Message, error) {
 	return Message{}, errors.New("message not found")
 }
 
-func (s *Store) DeleteMessage(id string) error {
+func (s *Store) DeleteMessage(id string) (Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -206,12 +212,13 @@ func (s *Store) DeleteMessage(id string) error {
 		if s.Messages[i].ID != id {
 			continue
 		}
+		message := s.Messages[i]
 		conversationID := s.Messages[i].ConversationID
 		s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
 		s.bumpConversationUpdatedAtLocked(conversationID, time.Now())
-		return s.saveLocked()
+		return message, s.saveLocked()
 	}
-	return errors.New("message not found")
+	return Message{}, errors.New("message not found")
 }
 
 func (s *Store) hasConversationLocked(id string) bool {
@@ -246,7 +253,7 @@ func (s *Store) saveLocked() error {
 
 func normalizeMessageType(value string) string {
 	switch value {
-	case "text", "image":
+	case "text", "image", "file":
 		return value
 	default:
 		return "text"

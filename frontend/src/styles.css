@@ -378,6 +378,50 @@ button:disabled {
   background: var(--surface);
 }
 
+.file-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: min(320px, 100%);
+  max-width: 100%;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--page-fg);
+  padding: 10px;
+  text-decoration: none;
+}
+
+.file-icon {
+  display: grid;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.file-info {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.file-info strong,
+.file-info small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-info small {
+  color: var(--muted-3);
+  font-size: 12px;
+}
+
 .copy {
   min-height: 30px;
   padding: 4px 8px;
@@ -395,6 +439,23 @@ button:disabled {
   min-height: 30px;
   padding: 4px 8px;
   font-size: 12px;
+}
+
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--page-fg);
+  padding: 4px 8px;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.button-link:hover {
+  border-color: var(--muted-3);
 }
 
 .inline-editor {
@@ -438,9 +499,13 @@ button:disabled {
 
 .composer-actions {
   display: grid;
-  grid-template-columns: 1fr 120px;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 120px;
   gap: 10px;
   margin-top: 10px;
+}
+
+.file-input {
+  display: none;
 }
 
 .composer-hint {
