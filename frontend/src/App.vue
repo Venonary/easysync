@@ -28,6 +28,7 @@ const themeMode = ref(safeStorageGet(STORAGE_THEME) || 'system')
 const systemPrefersDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches)
 const socket = ref(null)
 const messageList = ref(null)
+const composerTextarea = ref(null)
 const imageInput = ref(null)
 const fileInput = ref(null)
 const editingMessageId = ref('')
@@ -227,27 +228,35 @@ function sendMessage() {
 async function handlePaste(event) {
   const clipboardData = event.clipboardData
   const file = pickImageFile(clipboardData)
-  if (!file) {
-    const clipboardTypes = Array.from(clipboardData?.types || [])
-    if (clipboardTypes.some((item) => item === 'Files' || item.startsWith('image/'))) {
-      state.error = '检测到剪贴板内容，但未能读取图片文件'
+  if (file) {
+    event.preventDefault()
+    if (socket.value?.readyState !== WebSocket.OPEN || !activeConversation.value) {
+      state.error = '当前未连接到服务端，无法发送图片'
+      return
+    }
+
+    try {
+      await uploadFile(file)
+      uploadHint.value = '图片已发送'
+      state.error = ''
+    } catch (err) {
+      state.error = '图片上传失败，请尝试更小的图片'
+      uploadHint.value = '图片发送失败'
     }
     return
   }
 
-  event.preventDefault()
-  if (socket.value?.readyState !== WebSocket.OPEN || !activeConversation.value) {
-    state.error = '当前未连接到服务端，无法发送图片'
+  const pastedText = extractClipboardText(clipboardData)
+  if (pastedText) {
+    event.preventDefault()
+    insertTextIntoComposer(pastedText)
+    state.error = ''
     return
   }
 
-  try {
-    await uploadFile(file)
-    uploadHint.value = '图片已发送'
-    state.error = ''
-  } catch (err) {
-    state.error = '图片上传失败，请尝试更小的图片'
-    uploadHint.value = '图片发送失败'
+  const clipboardTypes = Array.from(clipboardData?.types || [])
+  if (clipboardTypes.some((item) => item === 'Files' || item.startsWith('image/'))) {
+    state.error = '检测到剪贴板内容，但未能读取图片文件'
   }
 }
 
@@ -263,6 +272,55 @@ function pickImageFile(clipboardData) {
   }
 
   return null
+}
+
+function extractClipboardText(clipboardData) {
+  if (!clipboardData?.getData) return ''
+
+  const plainText = clipboardData.getData('text/plain').trim()
+  if (plainText) return plainText
+
+  const uriList = normalizeUriList(clipboardData.getData('text/uri-list'))
+  if (uriList) return uriList
+
+  const htmlText = htmlToPlainText(clipboardData.getData('text/html'))
+  if (htmlText) return htmlText
+
+  return ''
+}
+
+function normalizeUriList(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => item && !item.startsWith('#'))
+    .join('\n')
+}
+
+function htmlToPlainText(html) {
+  if (!html) return ''
+  const container = document.createElement('div')
+  container.innerHTML = html
+  return (container.innerText || container.textContent || '').trim()
+}
+
+function insertTextIntoComposer(value) {
+  const target = composerTextarea.value
+  if (!target) {
+    text.value += value
+    return
+  }
+
+  const start = target.selectionStart ?? text.value.length
+  const end = target.selectionEnd ?? text.value.length
+  const nextText = `${text.value.slice(0, start)}${value}${text.value.slice(end)}`
+  text.value = nextText
+
+  nextTick(() => {
+    const cursor = start + value.length
+    target.focus()
+    target.setSelectionRange(cursor, cursor)
+  })
 }
 
 function chooseFile() {
@@ -715,6 +773,7 @@ function formatFileSize(size) {
 
       <footer class="composer">
         <textarea
+          ref="composerTextarea"
           v-model="text"
           placeholder="输入文本，Ctrl/⌘ + Enter 发送"
           @keydown="onTextareaKeydown"
