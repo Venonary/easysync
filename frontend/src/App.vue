@@ -423,13 +423,11 @@ async function copyImageMessage(message) {
       uploadHint.value = '图片已复制到剪贴板'
       return
     }
-  }
-
-  catch {
+  } catch {
     // fall through to the visible error below
   }
 
-  state.error = '当前环境不支持直接复制图片，请使用保存按钮'
+  state.error = '图片复制失败：浏览器剪贴板仅稳定支持 PNG，或权限被拒绝，请改用保存图片'
   uploadHint.value = '图片复制失败'
 }
 
@@ -442,18 +440,87 @@ async function saveImageMessage(message) {
 }
 
 async function tryCopyBlobAsImage(blob) {
-  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+  if (!window.isSecureContext || !navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
     return false
   }
 
+  // Chrome/Edge mostly accept image/png for ClipboardItem writes.
+  // JPEG/WebP/GIF often fail, so convert to PNG first.
   try {
+    const pngBlob = await ensurePngBlob(blob)
     await navigator.clipboard.write([
-      new ClipboardItem({ [blob.type || 'image/png']: blob })
+      new ClipboardItem({ 'image/png': pngBlob })
     ])
     return true
   } catch {
-    return false
+    // Some environments expect ClipboardItem values as Promise<Blob>.
+    try {
+      const pngBlobPromise = ensurePngBlob(blob)
+      await navigator.clipboard.write([
+        new ClipboardItem({ 'image/png': pngBlobPromise })
+      ])
+      return true
+    } catch {
+      return false
+    }
   }
+}
+
+async function ensurePngBlob(blob) {
+  if (blob?.type === 'image/png') {
+    return blob
+  }
+
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(blob)
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = bitmap.width
+      canvas.height = bitmap.height
+      const context = canvas.getContext('2d')
+      if (!context) {
+        throw new Error('canvas context unavailable')
+      }
+      context.drawImage(bitmap, 0, 0)
+      return await canvasToPngBlob(canvas)
+    } finally {
+      bitmap.close?.()
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(blob)
+  try {
+    const image = await loadImageElement(objectUrl)
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth || image.width
+    canvas.height = image.naturalHeight || image.height
+    const context = canvas.getContext('2d')
+    if (!context) {
+      throw new Error('canvas context unavailable')
+    }
+    context.drawImage(image, 0, 0)
+    return await canvasToPngBlob(canvas)
+  } finally {
+    URL.revokeObjectURL(objectUrl)
+  }
+}
+
+function canvasToPngBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) resolve(result)
+      else reject(new Error('failed to encode png'))
+    }, 'image/png')
+  })
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('failed to load image for clipboard'))
+    image.src = src
+  })
 }
 
 async function fetchAttachmentBlob(message) {
