@@ -370,16 +370,47 @@ async function uploadFile(file) {
 }
 
 async function pasteAndSend() {
-  if (!navigator.clipboard?.readText) {
-    state.error = '当前浏览器不支持直接读取剪贴板，请手动粘贴'
+  // Ctrl/Cmd+V goes through the paste event and can access image files.
+  // This button only has Clipboard API access, so it must handle images
+  // separately (clipboard.readText cannot return image data).
+  if (!window.isSecureContext || !navigator.clipboard) {
+    state.error = '当前浏览器不支持直接读取剪贴板，请在输入框中 Ctrl/Cmd+V 粘贴'
     return
   }
+
   try {
-    const value = await navigator.clipboard.readText()
-    text.value = value
-    sendMessage()
+    if (typeof navigator.clipboard.read === 'function') {
+      const items = await navigator.clipboard.read()
+      for (const item of items) {
+        const imageType = item.types.find((type) => type.startsWith('image/'))
+        if (!imageType) continue
+        const blob = await item.getType(imageType)
+        const extension = imageType.split('/')[1] || 'png'
+        const file = new File([blob], `pasted-image.${extension}`, {
+          type: imageType,
+          lastModified: Date.now()
+        })
+        await uploadFile(file)
+        uploadHint.value = '图片已发送'
+        state.error = ''
+        return
+      }
+    }
+
+    if (typeof navigator.clipboard.readText === 'function') {
+      const value = await navigator.clipboard.readText()
+      if (!value.trim()) {
+        state.error = '剪贴板为空，或仅有图片但当前环境不允许读取图片，请改用 Ctrl/Cmd+V'
+        return
+      }
+      text.value = value
+      sendMessage()
+      return
+    }
+
+    state.error = '当前浏览器不支持直接读取剪贴板，请在输入框中 Ctrl/Cmd+V 粘贴'
   } catch {
-    state.error = '浏览器拒绝读取剪贴板，可尝试 HTTPS 或手动粘贴'
+    state.error = '浏览器拒绝读取剪贴板，可尝试 HTTPS 或在输入框中 Ctrl/Cmd+V'
   }
 }
 
