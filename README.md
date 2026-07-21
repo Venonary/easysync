@@ -25,6 +25,15 @@ Release 包里已经包含后端可执行文件和嵌入好的前端页面，不
 - 支持 HTTP 与 HTTPS 启动
 - 支持图片粘贴、图片复制和图片保存
 
+## Docker 运行
+
+需要本机已安装 Docker / Docker Compose。数据与 TLS 材料保存在命名卷 `easysync-data`（容器内 `/data`），迁移时带走该卷即可。详见 [docs/docker.md](docs/docker.md)。
+
+```bash
+docker compose up -d --build
+curl -s http://127.0.0.1:7788/api/health
+```
+
 ## 开发运行
 
 先安装前端依赖并构建前端：
