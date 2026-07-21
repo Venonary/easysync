@@ -15,10 +15,17 @@ const themeOptions = [
 const state = reactive({
   conversations: [],
   messages: [],
+  deletedMessages: [],
+  settings: {
+    softDeleteUndoMinutes: 30
+  },
   presence: [],
   connected: false,
   error: ''
 })
+const softDeleteUndoDraft = ref(30)
+const settingsSaving = ref(false)
+const lastDeletedId = ref('')
 
 const text = ref('')
 const activeConversationId = ref(safeStorageGet(STORAGE_ACTIVE_CONVERSATION))
@@ -88,7 +95,11 @@ const activeConversation = computed(() => {
 const visibleMessages = computed(() => {
   const id = activeConversation.value?.id
   if (!id) return []
-  return state.messages.filter((message) => message.conversationId === id)
+  return state.messages.filter((message) => message.conversationId === id && !message.deletedAt)
+})
+
+const recentDeletedMessages = computed(() => {
+  return (state.deletedMessages || []).slice(0, 20)
 })
 
 const groupedPresence = computed(() => {
@@ -180,6 +191,11 @@ async function loadState() {
   const data = await response.json()
   state.conversations = data.conversations || []
   state.messages = data.messages || []
+  state.deletedMessages = data.deletedMessages || []
+  if (data.settings) {
+    state.settings = data.settings
+    softDeleteUndoDraft.value = Number(data.settings.softDeleteUndoMinutes ?? 30)
+  }
   if (!activeConversationId.value || !state.conversations.some((item) => item.id === activeConversationId.value)) {
     activeConversationId.value = state.conversations[0]?.id || ''
   }
@@ -218,7 +234,29 @@ function handleServerEvent(event) {
   } else if (event.type === 'message_updated') {
     upsertMessage(event.data)
   } else if (event.type === 'message_deleted') {
-    removeMessageById(event.data.id)
+    const id = event.data?.id
+    const soft = Boolean(event.data?.soft)
+    const existing = state.messages.find((item) => item.id === id)
+    if (soft && existing) {
+      const deleted = {
+        ...existing,
+        deletedAt: event.data.deletedAt || new Date().toISOString()
+      }
+      removeMessageById(id)
+      upsertDeletedMessage(deleted)
+      lastDeletedId.value = id
+    } else {
+      removeMessageById(id)
+      state.deletedMessages = state.deletedMessages.filter((item) => item.id !== id)
+      if (lastDeletedId.value === id) lastDeletedId.value = ''
+    }
+  } else if (event.type === 'message_restored') {
+    upsertMessage(event.data)
+    state.deletedMessages = state.deletedMessages.filter((item) => item.id !== event.data.id)
+    if (lastDeletedId.value === event.data.id) lastDeletedId.value = ''
+  } else if (event.type === 'settings') {
+    state.settings = event.data || state.settings
+    softDeleteUndoDraft.value = Number(state.settings.softDeleteUndoMinutes ?? 30)
   } else if (event.type === 'conversations') {
     state.conversations = event.data
     if (!state.conversations.some((item) => item.id === activeConversationId.value)) {
@@ -231,11 +269,18 @@ function handleServerEvent(event) {
   } else if (event.type === 'conversation_deleted') {
     state.conversations = state.conversations.filter((item) => item.id !== event.data.id)
     state.messages = state.messages.filter((item) => item.conversationId !== event.data.id)
+    state.deletedMessages = state.deletedMessages.filter((item) => item.conversationId !== event.data.id)
   } else if (event.type === 'presence') {
     state.presence = event.data || []
   } else if (event.type === 'error') {
     state.error = event.data
   }
+}
+
+function upsertDeletedMessage(message) {
+  const index = state.deletedMessages.findIndex((item) => item.id === message.id)
+  if (index >= 0) state.deletedMessages[index] = message
+  else state.deletedMessages.unshift(message)
 }
 
 function upsertConversation(conversation) {
@@ -646,13 +691,74 @@ async function saveEditMessage(message) {
 }
 
 async function deleteMessage(message) {
-  if (!window.confirm('删除这条消息？')) return
+  const windowMinutes = Number(state.settings.softDeleteUndoMinutes ?? 30)
+  const confirmText = windowMinutes > 0
+    ? `删除这条消息？可在 ${windowMinutes} 分钟内撤销。`
+    : '删除这条消息？将立即永久删除。'
+  if (!window.confirm(confirmText)) return
   const response = await fetch(`/api/messages/${message.id}`, {
     method: 'DELETE'
   })
   if (!response.ok) {
     state.error = await response.text()
+    return
   }
+  if (response.status !== 204) {
+    try {
+      const deleted = await response.json()
+      if (deleted?.id) {
+        removeMessageById(deleted.id)
+        upsertDeletedMessage(deleted)
+        lastDeletedId.value = deleted.id
+      }
+    } catch {
+      // broadcast will reconcile
+    }
+  }
+}
+
+async function restoreMessage(messageOrId) {
+  const id = typeof messageOrId === 'string' ? messageOrId : messageOrId?.id
+  if (!id) return
+  const response = await fetch(`/api/messages/${id}/restore`, { method: 'POST' })
+  if (!response.ok) {
+    state.error = await response.text()
+    return
+  }
+  const message = await response.json()
+  upsertMessage(message)
+  state.deletedMessages = state.deletedMessages.filter((item) => item.id !== id)
+  if (lastDeletedId.value === id) lastDeletedId.value = ''
+  state.error = ''
+}
+
+async function saveSoftDeleteSettings() {
+  const minutes = Math.max(0, Math.min(10080, Number(softDeleteUndoDraft.value) || 0))
+  softDeleteUndoDraft.value = minutes
+  settingsSaving.value = true
+  try {
+    const response = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ softDeleteUndoMinutes: minutes })
+    })
+    if (!response.ok) {
+      state.error = await response.text()
+      return
+    }
+    state.settings = await response.json()
+    state.error = ''
+  } finally {
+    settingsSaving.value = false
+  }
+}
+
+function deletedPreview(message) {
+  if (!message) return ''
+  if (message.type === 'image') return '[图片]'
+  if (message.type === 'file') return message.attachment?.name || message.content || '[文件]'
+  const text = String(message.content || '').replace(/\s+/g, ' ').trim()
+  return text.length > 40 ? `${text.slice(0, 40)}…` : text || '[空消息]'
 }
 
 async function createConversation() {
@@ -1035,6 +1141,50 @@ function formatFileSize(size) {
         </label>
         <p class="muted">当前：{{ effectiveTheme === 'dark' ? '深色' : '浅色' }}</p>
       </section>
+
+      <section class="settings-section">
+        <h3>消息设置</h3>
+        <label>
+          <span>删除可撤销时长（分钟）</span>
+          <input
+            v-model.number="softDeleteUndoDraft"
+            type="number"
+            min="0"
+            max="10080"
+            step="1"
+          />
+        </label>
+        <p class="muted">
+          0 = 立即永久删除；默认 30。当前生效：{{ state.settings.softDeleteUndoMinutes }} 分钟
+        </p>
+        <button
+          class="settings-save"
+          type="button"
+          :disabled="settingsSaving"
+          @click="saveSoftDeleteSettings"
+        >
+          {{ settingsSaving ? '保存中…' : '保存设置' }}
+        </button>
+      </section>
+
+      <section v-if="recentDeletedMessages.length" class="deleted-section">
+        <h3>最近删除</h3>
+        <p class="muted">窗口内可还原；超时后将永久清除。</p>
+        <div class="deleted-list">
+          <div v-for="item in recentDeletedMessages" :key="item.id" class="deleted-item">
+            <div class="deleted-meta">
+              <strong>{{ deletedPreview(item) }}</strong>
+              <span>{{ formatTime(item.deletedAt || item.updatedAt) }}</span>
+            </div>
+            <button type="button" class="restore-btn" @click="restoreMessage(item)">还原</button>
+          </div>
+        </div>
+      </section>
+
+      <div v-if="lastDeletedId" class="undo-banner">
+        <span>消息已删除</span>
+        <button type="button" @click="restoreMessage(lastDeletedId)">撤销</button>
+      </div>
 
       <section>
         <h3>在线设备</h3>

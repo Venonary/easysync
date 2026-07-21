@@ -48,6 +48,7 @@ func main() {
 		writeJSON(w, store.State())
 	})
 	mux.HandleFunc("/api/ca.crt", rootCADownloadHandler(*dataDir))
+	mux.HandleFunc("/api/settings", settingsHandler(store, hub))
 	mux.HandleFunc("/api/conversations", conversationsHandler(store, hub))
 	mux.HandleFunc("/api/conversations/", conversationHandler(store, hub))
 	mux.HandleFunc("/api/messages/", messageHandler(store, hub))
@@ -113,18 +114,67 @@ func (filteredErrorWriter) Write(p []byte) (int, error) {
 	return os.Stderr.Write(p)
 }
 
-func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
-	// messageHandler 处理单条消息的更新与删除操作。
-	// PATCH /api/messages/{id} 允许设备按其 deviceId 修改消息内容（有权限校验）。
-	// DELETE /api/messages/{id} 删除指定消息并在成功后广播变更。
+func settingsHandler(store *Store, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/api/messages/")
-		id = strings.Trim(id, "/")
-		if id == "" {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, store.GetSettings())
+		case http.MethodPut, http.MethodPatch:
+			var body Settings
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid json body", http.StatusBadRequest)
+				return
+			}
+			settings, err := store.UpdateSettings(body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hub.broadcast(ServerEvent{Type: "settings", Data: settings})
+			writeJSON(w, settings)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
+	// messageHandler 处理单条消息的更新、软删除与恢复。
+	// PATCH  /api/messages/{id}          修改内容
+	// DELETE /api/messages/{id}          软删除（可配置撤销窗口）
+	// POST   /api/messages/{id}/restore  在窗口内恢复
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api/messages/")
+		path = strings.Trim(path, "/")
+		if path == "" {
 			http.NotFound(w, r)
 			return
 		}
 
+		// Support /api/messages/{id}/restore
+		if strings.HasSuffix(path, "/restore") {
+			id := strings.TrimSuffix(path, "/restore")
+			id = strings.Trim(id, "/")
+			if id == "" || r.Method != http.MethodPost {
+				if r.Method != http.MethodPost {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				http.NotFound(w, r)
+				return
+			}
+			message, err := store.RestoreMessage(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hub.broadcast(ServerEvent{Type: "message_restored", Data: message})
+			hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
+			writeJSON(w, message)
+			return
+		}
+
+		id := path
 		switch r.Method {
 		case http.MethodPatch:
 			var body struct {
@@ -144,22 +194,33 @@ func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
 			hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
 			writeJSON(w, message)
 		case http.MethodDelete:
-			message, err := store.DeleteMessage(id)
+			message, removeAttachment, err := store.DeleteMessage(id)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if message.Attachment != nil {
+			if removeAttachment && message.Attachment != nil {
 				_ = os.Remove(filepath.Join(uploadRootFromStore(store), "uploads", message.Attachment.StoredName))
+			}
+			// Also drop any attachments for messages purged by expiry.
+			for _, storedName := range store.PurgeExpiredDeleted() {
+				_ = os.Remove(filepath.Join(uploadRootFromStore(store), "uploads", storedName))
 			}
 			hub.broadcast(ServerEvent{
 				Type: "message_deleted",
-				Data: map[string]string{"id": id},
+				Data: map[string]any{
+					"id":        id,
+					"soft":      !removeAttachment,
+					"deletedAt": message.DeletedAt,
+				},
 			})
 			hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
-			w.WriteHeader(http.StatusNoContent)
+			if removeAttachment {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			writeJSON(w, message)
 		default:
-			// 仅支持 PATCH 与 DELETE
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}

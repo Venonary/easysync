@@ -19,6 +19,7 @@ type Store struct {
 
 	Conversations []Conversation `json:"conversations"`
 	Messages      []Message      `json:"messages"`
+	Settings      Settings       `json:"settings"`
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -26,7 +27,10 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{path: filepath.Join(dataDir, "store.json")}
+	s := &Store{
+		path:     filepath.Join(dataDir, "store.json"),
+		Settings: Settings{SoftDeleteUndoMinutes: DefaultSoftDeleteUndoMinutes},
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -55,18 +59,78 @@ func (s *Store) load() error {
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return nil
 	}
-	return json.Unmarshal(data, s)
+
+	// Decode settings separately so a missing settings object becomes the default,
+	// while an explicit softDeleteUndoMinutes: 0 is preserved (immediate hard delete).
+	var raw struct {
+		Conversations []Conversation  `json:"conversations"`
+		Messages      []Message       `json:"messages"`
+		Settings      json.RawMessage `json:"settings"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.Conversations = raw.Conversations
+	s.Messages = raw.Messages
+	if len(raw.Settings) == 0 || string(raw.Settings) == "null" {
+		s.Settings = Settings{SoftDeleteUndoMinutes: DefaultSoftDeleteUndoMinutes}
+		return nil
+	}
+	var settings Settings
+	if err := json.Unmarshal(raw.Settings, &settings); err != nil {
+		return err
+	}
+	if settings.SoftDeleteUndoMinutes < 0 {
+		settings.SoftDeleteUndoMinutes = DefaultSoftDeleteUndoMinutes
+	}
+	s.Settings = settings
+	return nil
 }
 
 func (s *Store) State() AppState {
+	s.mu.Lock()
+	purged := s.purgeExpiredDeletedLocked(time.Now())
+	if purged {
+		_ = s.saveLocked()
+	}
+	conversations := append([]Conversation(nil), s.Conversations...)
+	live, deleted := s.partitionMessagesLocked()
+	settings := s.Settings
+	s.mu.Unlock()
+
+	sortConversations(conversations)
+	sortMessages(live)
+	sortDeletedMessages(deleted)
+	return AppState{
+		Conversations:   conversations,
+		Messages:        live,
+		DeletedMessages: deleted,
+		Settings:        settings,
+	}
+}
+
+func (s *Store) GetSettings() Settings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.Settings
+}
 
-	conversations := append([]Conversation(nil), s.Conversations...)
-	messages := append([]Message(nil), s.Messages...)
-	sortConversations(conversations)
-	sortMessages(messages)
-	return AppState{Conversations: conversations, Messages: messages}
+func (s *Store) UpdateSettings(next Settings) (Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if next.SoftDeleteUndoMinutes < 0 {
+		return Settings{}, errors.New("softDeleteUndoMinutes must be >= 0")
+	}
+	// Cap at 7 days to avoid unbounded tombstones.
+	if next.SoftDeleteUndoMinutes > 7*24*60 {
+		return Settings{}, errors.New("softDeleteUndoMinutes must be <= 10080 (7 days)")
+	}
+	s.Settings = next
+	if err := s.saveLocked(); err != nil {
+		return Settings{}, err
+	}
+	return s.Settings, nil
 }
 
 func (s *Store) ListConversations() []Conversation {
@@ -157,6 +221,7 @@ func (s *Store) AddMessage(message Message) (Message, error) {
 	message.Content = strings.TrimSpace(message.Content)
 	message.CreatedAt = time.Now()
 	message.UpdatedAt = message.CreatedAt
+	message.DeletedAt = nil
 	if message.Content == "" && message.Attachment == nil {
 		return Message{}, errors.New("message content is required")
 	}
@@ -190,6 +255,9 @@ func (s *Store) UpdateMessage(id, deviceID, content string) (Message, error) {
 		if s.Messages[i].ID != id {
 			continue
 		}
+		if s.Messages[i].DeletedAt != nil {
+			return Message{}, errors.New("cannot edit a deleted message")
+		}
 		if strings.TrimSpace(deviceID) == "" || s.Messages[i].DeviceID != deviceID {
 			return Message{}, errors.New("permission denied")
 		}
@@ -204,21 +272,142 @@ func (s *Store) UpdateMessage(id, deviceID, content string) (Message, error) {
 	return Message{}, errors.New("message not found")
 }
 
-func (s *Store) DeleteMessage(id string) (Message, error) {
+// DeleteMessage soft-deletes when SoftDeleteUndoMinutes > 0, otherwise hard-deletes.
+// Returns the message and whether the attachment file should be removed immediately.
+func (s *Store) DeleteMessage(id string) (Message, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	_ = s.purgeExpiredDeletedLocked(time.Now())
 
 	for i := range s.Messages {
 		if s.Messages[i].ID != id {
 			continue
 		}
+		if s.Messages[i].DeletedAt != nil {
+			return Message{}, false, errors.New("message already deleted")
+		}
+
+		now := time.Now()
+		if s.Settings.SoftDeleteUndoMinutes <= 0 {
+			message := s.Messages[i]
+			conversationID := message.ConversationID
+			s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
+			s.bumpConversationUpdatedAtLocked(conversationID, now)
+			if err := s.saveLocked(); err != nil {
+				return Message{}, false, err
+			}
+			return message, true, nil
+		}
+
+		deletedAt := now
+		s.Messages[i].DeletedAt = &deletedAt
+		s.Messages[i].UpdatedAt = now
+		s.bumpConversationUpdatedAtLocked(s.Messages[i].ConversationID, now)
 		message := s.Messages[i]
-		conversationID := s.Messages[i].ConversationID
-		s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
-		s.bumpConversationUpdatedAtLocked(conversationID, time.Now())
-		return message, s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			return Message{}, false, err
+		}
+		return message, false, nil
+	}
+	return Message{}, false, errors.New("message not found")
+}
+
+// RestoreMessage undoes a soft-delete if still within the undo window.
+func (s *Store) RestoreMessage(id string) (Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = s.purgeExpiredDeletedLocked(time.Now())
+
+	for i := range s.Messages {
+		if s.Messages[i].ID != id {
+			continue
+		}
+		if s.Messages[i].DeletedAt == nil {
+			return Message{}, errors.New("message is not deleted")
+		}
+		if !s.canRestoreLocked(s.Messages[i], time.Now()) {
+			// Window expired: purge this message and deny restore.
+			s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
+			_ = s.saveLocked()
+			return Message{}, errors.New("restore window expired")
+		}
+		s.Messages[i].DeletedAt = nil
+		s.Messages[i].UpdatedAt = time.Now()
+		s.bumpConversationUpdatedAtLocked(s.Messages[i].ConversationID, s.Messages[i].UpdatedAt)
+		if err := s.saveLocked(); err != nil {
+			return Message{}, err
+		}
+		return s.Messages[i], nil
 	}
 	return Message{}, errors.New("message not found")
+}
+
+// PurgeExpiredDeleted removes soft-deleted messages past the undo window.
+// Returns attachment stored names that should be deleted from disk.
+func (s *Store) PurgeExpiredDeleted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var removed []string
+	now := time.Now()
+	kept := s.Messages[:0]
+	changed := false
+	for _, message := range s.Messages {
+		if message.DeletedAt != nil && !s.canRestoreLocked(message, now) {
+			changed = true
+			if message.Attachment != nil && message.Attachment.StoredName != "" {
+				removed = append(removed, message.Attachment.StoredName)
+			}
+			continue
+		}
+		kept = append(kept, message)
+	}
+	if changed {
+		s.Messages = kept
+		_ = s.saveLocked()
+	}
+	return removed
+}
+
+func (s *Store) canRestoreLocked(message Message, now time.Time) bool {
+	if message.DeletedAt == nil {
+		return false
+	}
+	minutes := s.Settings.SoftDeleteUndoMinutes
+	if minutes <= 0 {
+		return false
+	}
+	deadline := message.DeletedAt.Add(time.Duration(minutes) * time.Minute)
+	return !now.After(deadline)
+}
+
+func (s *Store) partitionMessagesLocked() (live, deleted []Message) {
+	for _, message := range s.Messages {
+		if message.DeletedAt != nil {
+			deleted = append(deleted, message)
+		} else {
+			live = append(live, message)
+		}
+	}
+	return live, deleted
+}
+
+func (s *Store) purgeExpiredDeletedLocked(now time.Time) bool {
+	kept := s.Messages[:0]
+	changed := false
+	for _, message := range s.Messages {
+		if message.DeletedAt != nil && !s.canRestoreLocked(message, now) {
+			changed = true
+			continue
+		}
+		kept = append(kept, message)
+	}
+	if changed {
+		s.Messages = kept
+	}
+	return changed
 }
 
 func (s *Store) hasConversationLocked(id string) bool {
@@ -269,6 +458,16 @@ func sortConversations(conversations []Conversation) {
 func sortMessages(messages []Message) {
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+	})
+}
+
+func sortDeletedMessages(messages []Message) {
+	sort.SliceStable(messages, func(i, j int) bool {
+		ai, bi := messages[i].DeletedAt, messages[j].DeletedAt
+		if ai == nil || bi == nil {
+			return messages[i].CreatedAt.After(messages[j].CreatedAt)
+		}
+		return ai.After(*bi)
 	})
 }
 

@@ -20,6 +20,7 @@ type Message struct {
 	Attachment     *Attachment `json:"attachment,omitempty"`
 	CreatedAt      time.Time   `json:"createdAt"`
 	UpdatedAt      time.Time   `json:"updatedAt"`
+	DeletedAt      *time.Time  `json:"deletedAt,omitempty"`
 }
 
 type Attachment struct {
@@ -30,7 +31,17 @@ type Attachment struct {
 	Size       int64  `json:"size"`
 }
 
+// Settings holds shared server-side policy. SoftDeleteUndoMinutes is how long a
+// soft-deleted message can be restored (0 means immediate hard delete).
+type Settings struct {
+	SoftDeleteUndoMinutes int `json:"softDeleteUndoMinutes"`
+}
+
+const DefaultSoftDeleteUndoMinutes = 30
+
 type AppState struct {
-	Conversations []Conversation `json:"conversations"`
-	Messages      []Message      `json:"messages"`
+	Conversations    []Conversation `json:"conversations"`
+	Messages         []Message      `json:"messages"`
+	DeletedMessages  []Message      `json:"deletedMessages"`
+	Settings         Settings       `json:"settings"`
 }
