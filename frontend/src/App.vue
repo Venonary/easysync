@@ -35,6 +35,10 @@ const editingMessageId = ref('')
 const editingText = ref('')
 const uploadHint = ref('可粘贴图片，或从文件/相册中选择上传')
 const uploading = ref(false)
+const sidebarOpen = ref(false)
+const devicePanelOpen = ref(false)
+const isNarrow = ref(typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches)
+let narrowQueryList = null
 const globalPasteHandler = (event) => {
   const target = event.target
   const tagName = target?.tagName?.toLowerCase()
@@ -45,6 +49,36 @@ let mediaQueryList = null
 
 const handleSystemThemeChange = (event) => {
   systemPrefersDark.value = event.matches
+}
+
+const handleNarrowChange = (event) => {
+  isNarrow.value = event.matches
+  if (!event.matches) {
+    sidebarOpen.value = false
+    devicePanelOpen.value = false
+  }
+}
+
+function toggleSidebar() {
+  sidebarOpen.value = !sidebarOpen.value
+  if (sidebarOpen.value) devicePanelOpen.value = false
+}
+
+function toggleDevicePanel() {
+  devicePanelOpen.value = !devicePanelOpen.value
+  if (devicePanelOpen.value) sidebarOpen.value = false
+}
+
+function closeDrawers() {
+  sidebarOpen.value = false
+  devicePanelOpen.value = false
+}
+
+function selectConversation(id) {
+  activeConversationId.value = id
+  if (isNarrow.value) {
+    sidebarOpen.value = false
+  }
 }
 
 const activeConversation = computed(() => {
@@ -109,6 +143,13 @@ onMounted(async () => {
   } else if (mediaQueryList.addListener) {
     mediaQueryList.addListener(handleSystemThemeChange)
   }
+  narrowQueryList = window.matchMedia('(max-width: 720px)')
+  isNarrow.value = narrowQueryList.matches
+  if (narrowQueryList.addEventListener) {
+    narrowQueryList.addEventListener('change', handleNarrowChange)
+  } else if (narrowQueryList.addListener) {
+    narrowQueryList.addListener(handleNarrowChange)
+  }
   window.addEventListener('paste', globalPasteHandler)
   await loadState()
   connect()
@@ -120,6 +161,13 @@ onBeforeUnmount(() => {
       mediaQueryList.removeEventListener('change', handleSystemThemeChange)
     } else if (mediaQueryList.removeListener) {
       mediaQueryList.removeListener(handleSystemThemeChange)
+    }
+  }
+  if (narrowQueryList) {
+    if (narrowQueryList.removeEventListener) {
+      narrowQueryList.removeEventListener('change', handleNarrowChange)
+    } else if (narrowQueryList.removeListener) {
+      narrowQueryList.removeListener(handleNarrowChange)
     }
   }
   window.removeEventListener('paste', globalPasteHandler)
@@ -747,16 +795,39 @@ function formatFileSize(size) {
 </script>
 
 <template>
-  <main class="app-shell">
-    <aside class="sidebar">
+  <main
+    class="app-shell"
+    :class="{
+      'sidebar-open': sidebarOpen,
+      'device-panel-open': devicePanelOpen
+    }"
+  >
+    <div
+      v-if="sidebarOpen || devicePanelOpen"
+      class="drawer-backdrop"
+      @click="closeDrawers"
+    />
+
+    <aside class="sidebar" :class="{ open: sidebarOpen }" aria-label="会话列表">
       <div class="brand">
         <div>
           <h1>EasySync</h1>
-          <p>局域网文本同步</p>
+          <p class="brand-subtitle">局域网文本同步</p>
         </div>
-        <span class="status" :class="{ online: state.connected }">
-          {{ state.connected ? '在线' : '重连中' }}
-        </span>
+        <div class="brand-tools">
+          <span class="status" :class="{ online: state.connected }">
+            {{ state.connected ? '在线' : '重连中' }}
+          </span>
+          <button
+            class="icon-button drawer-close"
+            type="button"
+            aria-label="关闭会话列表"
+            title="关闭"
+            @click="sidebarOpen = false"
+          >
+            ×
+          </button>
+        </div>
       </div>
 
       <button class="primary-action" @click="createConversation">新建会话</button>
@@ -768,7 +839,7 @@ function formatFileSize(size) {
           class="conversation-item"
           :class="{ active: activeConversationId === conversation.id }"
         >
-          <div class="conversation-select" @click="activeConversationId = conversation.id">
+          <div class="conversation-select" @click="selectConversation(conversation.id)">
             <span class="conversation-title-row">
               <span class="conversation-title">{{ conversation.title }}</span>
               <button
@@ -798,28 +869,64 @@ function formatFileSize(size) {
 
     <section class="workspace">
       <header class="topbar">
-        <div>
+        <div class="topbar-main">
+          <button
+            class="icon-button topbar-toggle toggle-sidebar"
+            type="button"
+            :aria-expanded="sidebarOpen ? 'true' : 'false'"
+            aria-label="展开或收起会话列表"
+            title="会话列表"
+            @click="toggleSidebar"
+          >
+            ☰
+          </button>
+          <div class="topbar-title-block">
+            <button
+              v-if="activeConversation"
+              class="topbar-title-action"
+              type="button"
+              @click="renameConversation(activeConversation)"
+              :aria-label="`重命名 ${activeConversation.title}`"
+              title="点击标题改名"
+            >
+              <h2>{{ activeConversation.title }}</h2>
+              <span class="topbar-pencil" aria-hidden="true">✎</span>
+            </button>
+            <h2 v-else>暂无会话</h2>
+            <p class="topbar-meta">{{ visibleMessages.length }} 条消息</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
           <button
             v-if="activeConversation"
-            class="topbar-title-action"
+            class="topbar-action-btn"
             type="button"
             @click="renameConversation(activeConversation)"
-            :aria-label="`重命名 ${activeConversation.title}`"
-            title="点击标题改名"
           >
-            <h2>{{ activeConversation.title }}</h2>
-            <span class="topbar-pencil" aria-hidden="true">✎</span>
+            重命名
           </button>
-          <h2 v-else>暂无会话</h2>
-          <p>{{ visibleMessages.length }} 条消息</p>
-        </div>
-        <div class="topbar-actions" v-if="activeConversation">
-          <button @click="renameConversation(activeConversation)">重命名</button>
-          <button class="danger" @click="deleteConversation(activeConversation)">删除</button>
+          <button
+            v-if="activeConversation"
+            class="danger topbar-action-btn"
+            type="button"
+            @click="deleteConversation(activeConversation)"
+          >
+            删除
+          </button>
+          <button
+            class="icon-button topbar-toggle toggle-settings"
+            type="button"
+            :aria-expanded="devicePanelOpen ? 'true' : 'false'"
+            aria-label="展开或收起设备与设置"
+            title="设备与设置"
+            @click="toggleDevicePanel"
+          >
+            ⚙
+          </button>
         </div>
       </header>
 
-      <div ref="messageList" class="message-list">
+      <div ref="messageList" class="message-list" data-testid="message-list">
         <div v-if="visibleMessages.length === 0" class="empty">
           在下方输入文本，局域网内打开此页面的设备会实时看到。
         </div>
@@ -881,19 +988,32 @@ function formatFileSize(size) {
           <input ref="imageInput" class="file-input" type="file" multiple accept="image/*" @change="handleFileSelected" />
           <input ref="fileInput" class="file-input" type="file" multiple @change="handleFileSelected" />
           <button :disabled="uploading || !activeConversation" @click="chooseImage">
-            {{ uploading ? '上传中' : '上传图片' }}
+            {{ uploading ? '上传中' : '图片' }}
           </button>
           <button :disabled="uploading || !activeConversation" @click="chooseFile">
-            {{ uploading ? '上传中' : '上传文件' }}
+            {{ uploading ? '上传中' : '文件' }}
           </button>
-          <button @click="pasteAndSend">粘贴并发送</button>
+          <button @click="pasteAndSend">粘贴发送</button>
           <button class="send" :disabled="!text.trim() || !state.connected" @click="sendMessage">发送</button>
         </div>
         <p class="muted composer-hint">{{ uploadHint }}</p>
       </footer>
     </section>
 
-    <aside class="device-panel">
+    <aside class="device-panel" :class="{ open: devicePanelOpen }" aria-label="设备与设置">
+      <div class="panel-header">
+        <h3>设备与设置</h3>
+        <button
+          class="icon-button drawer-close"
+          type="button"
+          aria-label="关闭设备与设置"
+          title="关闭"
+          @click="devicePanelOpen = false"
+        >
+          ×
+        </button>
+      </div>
+
       <section>
         <h3>本机标识</h3>
         <label>
