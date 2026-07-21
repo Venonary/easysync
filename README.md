@@ -82,18 +82,26 @@ go build -o easysync.exe .
 
 ## HTTPS 注意事项
 
-默认情况下，`-https` 会使用程序自动生成的自签名证书。这个证书适合局域网测试，但浏览器通常会显示“你的连接不是专用连接”或“不受信任”的提示。
+默认情况下，`-https` 会生成（并复用）一个 **EasySync Root CA**，再用它签发服务器证书。浏览器仍会提示不安全，直到你在设备上安装根证书。
 
-这是正常现象，不是程序故障。你可以这样处理：
+推荐流程：
 
-- 本机/局域网测试：直接忽略警告继续访问，或者把生成的证书导入到受信任根证书中。
-- 长期对外使用：使用正式域名和受信任证书，例如 Let’s Encrypt。
-- 开发环境：可以使用 `mkcert` 生成受信任的本地证书，然后通过 `-tls-cert` 和 `-tls-key` 指定。
+1. 启动服务后下载根证书：`http(s)://主机:端口/api/ca.crt`（文件名 `easysync-root-ca.crt`）。
+2. 在 Windows / Android / iOS / macOS 上把该 CA 安装为受信任根证书（详见 [docs/root-ca-https.md](docs/root-ca-https.md)）。
+3. 重新打开 `https://…`，浏览器应能验证服务器证书链。
+
+其他选项：
+
+- 临时忽略浏览器警告继续访问（仅适合测试）。
+- 长期对外使用正式域名与 Let’s Encrypt 等受信任证书。
+- 使用 `mkcert` 等工具生成证书，再通过 `-tls-cert` 和 `-tls-key` 指定。
 
 示例：
 
 ```powershell
 go run . -https -addr :7788
+# 下载根证书：
+# Invoke-WebRequest http://127.0.0.1:7788/api/ca.crt -OutFile easysync-root-ca.crt
 ```
 
 服务启动后会打印本机和局域网访问地址，例如：

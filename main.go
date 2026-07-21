@@ -2,27 +2,20 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"embed"
 	"encoding/json"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 //go:embed all:frontend/dist
@@ -54,6 +47,7 @@ func main() {
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, store.State())
 	})
+	mux.HandleFunc("/api/ca.crt", rootCADownloadHandler(*dataDir))
 	mux.HandleFunc("/api/conversations", conversationsHandler(store, hub))
 	mux.HandleFunc("/api/conversations/", conversationHandler(store, hub))
 	mux.HandleFunc("/api/messages/", messageHandler(store, hub))
@@ -64,10 +58,11 @@ func main() {
 
 	printStartup(*addr, *dataDir, *useHTTPS)
 	if *useHTTPS {
-		certFile, keyFile, err := ensureTLSFiles(*dataDir, *tlsCert, *tlsKey)
+		material, err := EnsureTLSMaterial(*dataDir, *tlsCert, *tlsKey)
 		if err != nil {
 			log.Fatal(err)
 		}
+		fmt.Printf("  Root CA:  %s (download /api/ca.crt)\n", material.RootCACert)
 		server := &http.Server{
 			Addr:    *addr,
 			Handler: logRequests(mux),
@@ -76,10 +71,37 @@ func main() {
 			},
 			ErrorLog: log.New(filteredErrorWriter{}, "", 0),
 		}
-		log.Fatal(server.ListenAndServeTLS(certFile, keyFile))
+		log.Fatal(server.ListenAndServeTLS(material.ServerCert, material.ServerKey))
 		return
 	}
 	log.Fatal(http.ListenAndServe(*addr, logRequests(mux)))
+}
+
+func rootCADownloadHandler(dataDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		path := RootCAPath(dataDir)
+		if _, err := os.Stat(path); err != nil {
+			// Lazily create a root CA even when HTTPS is not currently enabled,
+			// so users can download/install before flipping -https on.
+			if _, err := EnsureTLSMaterial(dataDir, "", ""); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "root CA not available", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+rootCACertFileName+`"`)
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(data)
+	}
 }
 
 type filteredErrorWriter struct{}
@@ -89,109 +111,6 @@ func (filteredErrorWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	return os.Stderr.Write(p)
-}
-
-func ensureTLSFiles(dataDir, certFile, keyFile string) (string, string, error) {
-	if certFile != "" && keyFile != "" {
-		return certFile, keyFile, nil
-	}
-
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return "", "", err
-	}
-
-	if certFile == "" {
-		certFile = filepath.Join(dataDir, "https-cert.pem")
-	}
-	if keyFile == "" {
-		keyFile = filepath.Join(dataDir, "https-key.pem")
-	}
-
-	if _, err := os.Stat(certFile); err == nil {
-		if _, err := os.Stat(keyFile); err == nil {
-			return certFile, keyFile, nil
-		}
-	}
-
-	if err := generateSelfSignedCert(certFile, keyFile); err != nil {
-		return "", "", err
-	}
-	return certFile, keyFile, nil
-}
-
-func generateSelfSignedCert(certFile, keyFile string) error {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return err
-	}
-
-	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialLimit)
-	if err != nil {
-		return err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject:      pkix.Name{CommonName: "EasySync"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().AddDate(1, 0, 0),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-	}
-
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				ipNet, ok := addr.(*net.IPNet)
-				if !ok {
-					continue
-				}
-				ip := ipNet.IP.To4()
-				if ip != nil {
-					template.IPAddresses = append(template.IPAddresses, ip)
-				}
-			}
-		}
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		return err
-	}
-
-	certOut, err := os.Create(certFile)
-	if err != nil {
-		return err
-	}
-	defer certOut.Close()
-	if err := pemEncode(certOut, "CERTIFICATE", derBytes); err != nil {
-		return err
-	}
-
-	keyOut, err := os.Create(keyFile)
-	if err != nil {
-		return err
-	}
-	defer keyOut.Close()
-	return pemEncode(keyOut, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(privateKey))
-}
-
-func pemEncode(file *os.File, blockType string, bytes []byte) error {
-	if err := pem.Encode(file, &pem.Block{Type: blockType, Bytes: bytes}); err != nil {
-		return err
-	}
-	return nil
 }
 
 func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
@@ -481,6 +400,7 @@ func printStartup(addr, dataDir string, useHTTPS bool) {
 	}
 	fmt.Printf("  Frontend: Embedded\n")
 	fmt.Printf("  Data:     %s\n", dataDir)
+	fmt.Printf("  Root CA:  %s://127.0.0.1:%s/api/ca.crt\n", scheme, port)
 }
 
 func lanIPv4s() []string {
