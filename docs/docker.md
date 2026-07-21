@@ -94,7 +94,9 @@ Multi-stage Dockerfile:
 
 1. `node:22-alpine` — `npm ci` + Vite build  
 2. `golang:1.24-alpine` — embed `frontend/dist`, static binary  
-3. `alpine:3.21` — non-root user `easysync` (uid 10001), volume `/data`
+3. `alpine:3.21` — `docker-entrypoint.sh` starts as root, `chown`s `/data` to uid **10001** (`easysync`), then `su-exec` drops privileges before running the binary
+
+This avoids the common named-volume pitfall where Docker creates `easysync-data` as root-owned and a non-root process cannot write `store.json`.
 
 ## Rollback
 

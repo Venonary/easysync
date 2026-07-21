@@ -45,7 +45,9 @@ func main() {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, store.State())
+		state, purged := store.StateAndPurge()
+		removeUploadFiles(store, purged)
+		writeJSON(w, state)
 	})
 	mux.HandleFunc("/api/ca.crt", rootCADownloadHandler(*dataDir))
 	mux.HandleFunc("/api/settings", settingsHandler(store, hub))
@@ -163,7 +165,8 @@ func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
 				http.NotFound(w, r)
 				return
 			}
-			message, err := store.RestoreMessage(id)
+			message, purged, err := store.RestoreMessage(id)
+			removeUploadFiles(store, purged)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -194,18 +197,16 @@ func messageHandler(store *Store, hub *Hub) http.HandlerFunc {
 			hub.broadcast(ServerEvent{Type: "conversations", Data: store.ListConversations()})
 			writeJSON(w, message)
 		case http.MethodDelete:
-			message, removeAttachment, err := store.DeleteMessage(id)
+			message, removeAttachment, purged, err := store.DeleteMessage(id)
 			if err != nil {
+				removeUploadFiles(store, purged)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if removeAttachment && message.Attachment != nil {
-				_ = os.Remove(filepath.Join(uploadRootFromStore(store), "uploads", message.Attachment.StoredName))
+			if removeAttachment && message.Attachment != nil && message.Attachment.StoredName != "" {
+				purged = append(purged, message.Attachment.StoredName)
 			}
-			// Also drop any attachments for messages purged by expiry.
-			for _, storedName := range store.PurgeExpiredDeleted() {
-				_ = os.Remove(filepath.Join(uploadRootFromStore(store), "uploads", storedName))
-			}
+			removeUploadFiles(store, purged)
 			hub.broadcast(ServerEvent{
 				Type: "message_deleted",
 				Data: map[string]any{
@@ -324,6 +325,20 @@ func serveUploadHandler(dataDir string) http.HandlerFunc {
 
 func uploadRootFromStore(store *Store) string {
 	return filepath.Dir(store.path)
+}
+
+func removeUploadFiles(store *Store, storedNames []string) {
+	if len(storedNames) == 0 {
+		return
+	}
+	root := filepath.Join(uploadRootFromStore(store), "uploads")
+	for _, name := range storedNames {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(root, name))
+	}
 }
 
 func conversationsHandler(store *Store, hub *Hub) http.HandlerFunc {

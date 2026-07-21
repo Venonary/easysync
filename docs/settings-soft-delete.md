@@ -36,7 +36,10 @@ Behavior:
 1. **Soft delete** (`softDeleteUndoMinutes > 0`): sets `deletedAt`, keeps content/attachments, removes from live `messages`, appears in `deletedMessages`.
 2. **Hard delete** (`softDeleteUndoMinutes == 0`): removes the message immediately and deletes attachment files.
 3. **Restore** within the window: clears `deletedAt`, returns the message to the live list.
-4. **After the window**: restore fails; message is purged (attachments cleaned when purge runs).
+4. **After the window**: restore fails; message is purged. Attachment files are unlinked on every purge path:
+   - `GET /api/state` (`StateAndPurge`)
+   - `POST /api/messages/{id}/restore` (expired tombstones collected during restore)
+   - `DELETE /api/messages/{id}` (expired tombstones + hard-delete target)
 
 ### WebSocket events
 

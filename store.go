@@ -87,10 +87,19 @@ func (s *Store) load() error {
 	return nil
 }
 
+// State returns the live app snapshot. It purges expired soft-deletes from the
+// store; use StateAndPurge when the caller must also remove attachment files.
 func (s *Store) State() AppState {
+	state, _ := s.StateAndPurge()
+	return state
+}
+
+// StateAndPurge is like State but also returns attachment stored names that were
+// dropped because their soft-delete undo window expired (caller should unlink files).
+func (s *Store) StateAndPurge() (AppState, []string) {
 	s.mu.Lock()
-	purged := s.purgeExpiredDeletedLocked(time.Now())
-	if purged {
+	removed, changed := s.purgeExpiredDeletedLocked(time.Now())
+	if changed {
 		_ = s.saveLocked()
 	}
 	conversations := append([]Conversation(nil), s.Conversations...)
@@ -106,7 +115,7 @@ func (s *Store) State() AppState {
 		Messages:        live,
 		DeletedMessages: deleted,
 		Settings:        settings,
-	}
+	}, removed
 }
 
 func (s *Store) GetSettings() Settings {
@@ -273,19 +282,23 @@ func (s *Store) UpdateMessage(id, deviceID, content string) (Message, error) {
 }
 
 // DeleteMessage soft-deletes when SoftDeleteUndoMinutes > 0, otherwise hard-deletes.
-// Returns the message and whether the attachment file should be removed immediately.
-func (s *Store) DeleteMessage(id string) (Message, bool, error) {
+// Returns the message, whether this message's attachment should be removed immediately,
+// and any attachment stored names purged because other soft-deletes expired.
+func (s *Store) DeleteMessage(id string) (Message, bool, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_ = s.purgeExpiredDeletedLocked(time.Now())
+	purged, purgedChanged := s.purgeExpiredDeletedLocked(time.Now())
 
 	for i := range s.Messages {
 		if s.Messages[i].ID != id {
 			continue
 		}
 		if s.Messages[i].DeletedAt != nil {
-			return Message{}, false, errors.New("message already deleted")
+			if purgedChanged {
+				_ = s.saveLocked()
+			}
+			return Message{}, false, purged, errors.New("message already deleted")
 		}
 
 		now := time.Now()
@@ -295,9 +308,9 @@ func (s *Store) DeleteMessage(id string) (Message, bool, error) {
 			s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
 			s.bumpConversationUpdatedAtLocked(conversationID, now)
 			if err := s.saveLocked(); err != nil {
-				return Message{}, false, err
+				return Message{}, false, purged, err
 			}
-			return message, true, nil
+			return message, true, purged, nil
 		}
 
 		deletedAt := now
@@ -306,42 +319,55 @@ func (s *Store) DeleteMessage(id string) (Message, bool, error) {
 		s.bumpConversationUpdatedAtLocked(s.Messages[i].ConversationID, now)
 		message := s.Messages[i]
 		if err := s.saveLocked(); err != nil {
-			return Message{}, false, err
+			return Message{}, false, purged, err
 		}
-		return message, false, nil
+		return message, false, purged, nil
 	}
-	return Message{}, false, errors.New("message not found")
+	if purgedChanged {
+		_ = s.saveLocked()
+	}
+	return Message{}, false, purged, errors.New("message not found")
 }
 
 // RestoreMessage undoes a soft-delete if still within the undo window.
-func (s *Store) RestoreMessage(id string) (Message, error) {
+// The second return value lists attachment files purged during the call (expired tombstones).
+func (s *Store) RestoreMessage(id string) (Message, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_ = s.purgeExpiredDeletedLocked(time.Now())
+	purged, purgedChanged := s.purgeExpiredDeletedLocked(time.Now())
 
 	for i := range s.Messages {
 		if s.Messages[i].ID != id {
 			continue
 		}
 		if s.Messages[i].DeletedAt == nil {
-			return Message{}, errors.New("message is not deleted")
+			if purgedChanged {
+				_ = s.saveLocked()
+			}
+			return Message{}, purged, errors.New("message is not deleted")
 		}
 		if !s.canRestoreLocked(s.Messages[i], time.Now()) {
-			// Window expired: purge this message and deny restore.
+			// Should be rare after purgeExpiredDeletedLocked; hard-purge this row.
+			if s.Messages[i].Attachment != nil && s.Messages[i].Attachment.StoredName != "" {
+				purged = append(purged, s.Messages[i].Attachment.StoredName)
+			}
 			s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
 			_ = s.saveLocked()
-			return Message{}, errors.New("restore window expired")
+			return Message{}, purged, errors.New("restore window expired")
 		}
 		s.Messages[i].DeletedAt = nil
 		s.Messages[i].UpdatedAt = time.Now()
 		s.bumpConversationUpdatedAtLocked(s.Messages[i].ConversationID, s.Messages[i].UpdatedAt)
 		if err := s.saveLocked(); err != nil {
-			return Message{}, err
+			return Message{}, purged, err
 		}
-		return s.Messages[i], nil
+		return s.Messages[i], purged, nil
 	}
-	return Message{}, errors.New("message not found")
+	if purgedChanged {
+		_ = s.saveLocked()
+	}
+	return Message{}, purged, errors.New("message not found")
 }
 
 // PurgeExpiredDeleted removes soft-deleted messages past the undo window.
@@ -350,22 +376,8 @@ func (s *Store) PurgeExpiredDeleted() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var removed []string
-	now := time.Now()
-	kept := s.Messages[:0]
-	changed := false
-	for _, message := range s.Messages {
-		if message.DeletedAt != nil && !s.canRestoreLocked(message, now) {
-			changed = true
-			if message.Attachment != nil && message.Attachment.StoredName != "" {
-				removed = append(removed, message.Attachment.StoredName)
-			}
-			continue
-		}
-		kept = append(kept, message)
-	}
+	removed, changed := s.purgeExpiredDeletedLocked(time.Now())
 	if changed {
-		s.Messages = kept
 		_ = s.saveLocked()
 	}
 	return removed
@@ -394,12 +406,16 @@ func (s *Store) partitionMessagesLocked() (live, deleted []Message) {
 	return live, deleted
 }
 
-func (s *Store) purgeExpiredDeletedLocked(now time.Time) bool {
+// purgeExpiredDeletedLocked drops soft-deleted messages past the undo window.
+// Returns attachment stored names for the caller to unlink and whether the slice changed.
+func (s *Store) purgeExpiredDeletedLocked(now time.Time) (removed []string, changed bool) {
 	kept := s.Messages[:0]
-	changed := false
 	for _, message := range s.Messages {
 		if message.DeletedAt != nil && !s.canRestoreLocked(message, now) {
 			changed = true
+			if message.Attachment != nil && message.Attachment.StoredName != "" {
+				removed = append(removed, message.Attachment.StoredName)
+			}
 			continue
 		}
 		kept = append(kept, message)
@@ -407,7 +423,7 @@ func (s *Store) purgeExpiredDeletedLocked(now time.Time) bool {
 	if changed {
 		s.Messages = kept
 	}
-	return changed
+	return removed, changed
 }
 
 func (s *Store) hasConversationLocked(id string) bool {

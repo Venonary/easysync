@@ -61,7 +61,7 @@ func TestStoreConversationAndMessageFlow(t *testing.T) {
 	}
 
 	// Soft-delete by default: message leaves live list but remains restorable.
-	if _, _, err := store.DeleteMessage(message.ID); err != nil {
+	if _, _, _, err := store.DeleteMessage(message.ID); err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range store.State().Messages {
@@ -79,7 +79,7 @@ func TestStoreConversationAndMessageFlow(t *testing.T) {
 		t.Fatal("expected soft-deleted message in DeletedMessages")
 	}
 
-	restored, err := store.RestoreMessage(message.ID)
+	restored, _, err := store.RestoreMessage(message.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestStoreConversationAndMessageFlow(t *testing.T) {
 	if _, err := store.UpdateSettings(Settings{SoftDeleteUndoMinutes: 0}); err != nil {
 		t.Fatal(err)
 	}
-	if _, removeAttachment, err := store.DeleteMessage(message.ID); err != nil {
+	if _, removeAttachment, _, err := store.DeleteMessage(message.ID); err != nil {
 		t.Fatal(err)
 	} else if !removeAttachment {
 		t.Fatal("expected hard delete when undo minutes is 0")
@@ -173,7 +173,7 @@ func TestStoreFileMessageFlow(t *testing.T) {
 		t.Fatalf("attachment was not persisted: %#v", message)
 	}
 
-	deleted, removeAttachment, err := store.DeleteMessage(message.ID)
+	deleted, removeAttachment, _, err := store.DeleteMessage(message.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestSoftDeleteRestoreWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deleted, removeAttachment, err := store.DeleteMessage(message.ID)
+	deleted, removeAttachment, _, err := store.DeleteMessage(message.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestSoftDeleteRestoreWindow(t *testing.T) {
 	}
 
 	// Restore within window succeeds.
-	restored, err := store.RestoreMessage(message.ID)
+	restored, _, err := store.RestoreMessage(message.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestSoftDeleteRestoreWindow(t *testing.T) {
 	}
 
 	// Soft-delete again, then expire the window by rewriting DeletedAt into the past.
-	if _, _, err := store.DeleteMessage(message.ID); err != nil {
+	if _, _, _, err := store.DeleteMessage(message.ID); err != nil {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
@@ -260,7 +260,7 @@ func TestSoftDeleteRestoreWindow(t *testing.T) {
 	}
 	store.mu.Unlock()
 
-	if _, err := store.RestoreMessage(message.ID); err == nil {
+	if _, _, err := store.RestoreMessage(message.ID); err == nil {
 		t.Fatal("expected restore after window to fail")
 	}
 	// After failed restore (or purge), message should be gone.
@@ -273,6 +273,62 @@ func TestSoftDeleteRestoreWindow(t *testing.T) {
 		if item.ID == message.ID {
 			t.Fatal("expired message should be purged from deleted list")
 		}
+	}
+}
+
+func TestStateAndPurgeRemovesExpiredAttachmentNames(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateSettings(Settings{SoftDeleteUndoMinutes: 30}); err != nil {
+		t.Fatal(err)
+	}
+
+	conversation := store.State().Conversations[0]
+	message, err := store.AddMessage(Message{
+		ConversationID: conversation.ID,
+		DeviceID:       "device-1",
+		DeviceName:     "Phone",
+		DeviceType:     "Android",
+		Type:           "image",
+		Content:        "photo.jpg",
+		Attachment: &Attachment{
+			URL:        "/uploads/expired-photo.jpg",
+			Name:       "photo.jpg",
+			StoredName: "expired-photo.jpg",
+			MimeType:   "image/jpeg",
+			Size:       100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.DeleteMessage(message.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	store.mu.Lock()
+	expired := time.Now().Add(-31 * time.Minute)
+	for i := range store.Messages {
+		if store.Messages[i].ID == message.ID {
+			store.Messages[i].DeletedAt = &expired
+		}
+	}
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+
+	_, purged := store.StateAndPurge()
+	if len(purged) != 1 || purged[0] != "expired-photo.jpg" {
+		t.Fatalf("expected purged attachment name, got %#v", purged)
+	}
+	// Second call should not re-report the same file.
+	_, purgedAgain := store.StateAndPurge()
+	if len(purgedAgain) != 0 {
+		t.Fatalf("expected no further purge, got %#v", purgedAgain)
 	}
 }
 
