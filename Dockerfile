@@ -32,13 +32,14 @@ VOLUME ["/data"]
 
 ENV EASYSYNC_ADDR=":7788" \
     EASYSYNC_DATA="/data" \
-    EASYSYNC_HTTPS="false"
+    EASYSYNC_HTTPS="true"
 
 EXPOSE 7788
 
 # Entrypoint starts as root, chowns /data for uid 10001, then drops to easysync.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1${EASYSYNC_ADDR}/api/health" || exit 1
+# Default is HTTPS (matches compose); use --no-check-certificate for private CA.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget --no-check-certificate -qO- "https://127.0.0.1:7788/api/health" || exit 1
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["-addr", ":7788", "-data", "/data"]
+CMD ["-addr", ":7788", "-data", "/data", "-https"]

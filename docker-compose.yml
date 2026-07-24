@@ -7,22 +7,23 @@ services:
     ports:
       - "7788:7788"
     volumes:
-      # Move this volume (or bind-mount path) to migrate chat history,
-      # uploads, settings, and TLS CA/leaf material to another host.
-      - easysync-data:/data
+      # Bind-mount: copy ./data to migrate chat history, uploads,
+      # settings, and TLS CA/leaf material to another host.
+      - ./data:/data
     environment:
-      # Optional documentation only; flags in command take effect.
       EASYSYNC_DATA: /data
-    # Default HTTP. For HTTPS inside the container:
-    # command: ["-addr", ":7788", "-data", "/data", "-https"]
-    command: ["-addr", ":7788", "-data", "/data"]
+      EASYSYNC_HTTPS: "true"
+    # HTTPS on :7788 — same as bare binary: -https -addr :7788
+    command: ["-addr", ":7788", "-data", "/data", "-https"]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7788/api/health"]
+      # Alpine busybox wget; --no-check-certificate for self-signed / private CA
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:7788/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
 
-volumes:
-  easysync-data:
-    name: easysync-data
+# Optional named volume alternative (comment bind-mount above, uncomment below):
+# volumes:
+#   easysync-data:
+#     name: easysync-data

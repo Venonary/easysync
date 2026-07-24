@@ -19,14 +19,21 @@ Keeping the same volume preserves chat history **and** the same root CA, so devi
 
 ## Quick start
 
+Default is **HTTPS on host port 7788** with bind-mount `./data:/data` (same flags as `./easysync -https -addr :7788`).
+
 ```bash
-# Build and run (HTTP on host port 7788)
+# Build and run
 docker compose up -d --build
 
-# Health
-curl -s http://127.0.0.1:7788/api/health
+# Health (self-signed / private CA — use -k)
+curl -sk https://127.0.0.1:7788/api/health
 # => {"status":"ok"}
+
+# Installable Root CA
+curl -sk https://127.0.0.1:7788/api/ca.crt -o easysync-root-ca.crt
 ```
+
+中文运维（部署 / 迁移 / 备份换机 / 更新测试）见 **[docker-deploy-ops.zh-CN.md](docker-deploy-ops.zh-CN.md)**。
 
 Plain Docker:
 
@@ -34,48 +41,36 @@ Plain Docker:
 docker build -t easysync:local .
 docker run -d --name easysync \
   -p 7788:7788 \
-  -v easysync-data:/data \
-  easysync:local
+  -v "$(pwd)/data:/data" \
+  easysync:local \
+  -addr :7788 -data /data -https
 ```
 
-## HTTPS in Docker
+## HTTPS notes
 
-```yaml
-# docker-compose.yml command override:
-command: ["-addr", ":7788", "-data", "/data", "-https"]
-```
-
-Then download the CA from `https://host:7788/api/ca.crt` (or copy from the volume) and install on clients. See [root-ca-https.md](root-ca-https.md).
+Compose and the image `CMD` already pass `-https`. Download the CA from `https://host:7788/api/ca.crt` (or copy `data/easysync-root-ca.crt`) and install on clients. See [root-ca-https.md](root-ca-https.md).
 
 ## Migrate to another device
 
-1. **Stop** the old container: `docker compose down` (do **not** pass `-v` if you want to keep data).
-2. **Export volume** (example with a temporary helper container):
+Default layout uses **bind-mount `./data`**:
 
 ```bash
-docker run --rm -v easysync-data:/data -v "$(pwd):/backup" alpine \
-  tar czf /backup/easysync-data.tgz -C /data .
-```
+# Stop (does not delete ./data)
+docker compose down
 
-3. On the new host: install Docker, copy this repo (or the image), restore:
+# Backup
+tar czf easysync-data.tgz -C data .
+# or: ./scripts/backup-easysync.sh
 
-```bash
-docker volume create easysync-data
-docker run --rm -v easysync-data:/data -v "$(pwd):/backup" alpine \
-  tar xzf /backup/easysync-data.tgz -C /data
+# On the new host: restore into project data/
+mkdir -p data
+tar xzf easysync-data.tgz -C data
 docker compose up -d --build
 ```
 
-4. Open the new host’s IP/port; root CA trust remains valid if the volume (and thus CA) was preserved.
+Root CA trust remains valid if `easysync-root-ca.crt` / `easysync-root-ca-key.pem` were preserved.
 
-### Bind-mount alternative
-
-```yaml
-volumes:
-  - ./data:/data
-```
-
-Then migrate by copying the `./data` folder with scp/rsync.
+Optional named volume workflow is documented in older revisions; prefer bind-mount for simple scp/rsync migration.
 
 ## Ports & flags
 
