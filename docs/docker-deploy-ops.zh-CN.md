@@ -123,7 +123,28 @@ ls -la /workspace/easysync/data/
 | `easysync-root-ca-key.pem` | 根私钥（**绝不可外泄/提交 Git**） |
 | `https-cert.pem` / `https-key.pem` | 服务端叶子证书与私钥 |
 
-应用在 `-https` 启动时调用 `EnsureTLSMaterial`：无 CA 则生成；叶子证书不匹配则重签。
+应用在 `-https` 启动时调用 `EnsureTLSMaterial`：无 CA 则生成；叶子证书不匹配或不含所需 IP/域名时用**同一 Root CA**重签叶子。
+
+### 3.1.1 浏览器报 `ERR_CERT_COMMON_NAME_INVALID` / “证书来自 localhost”
+
+根证书装对了仍可能出现。原因：Docker 容器内只能看到容器网卡 IP，叶子证书 SAN 若只有 `localhost`，用 `https://192.168.50.234:7788` 访问就会名称不匹配。
+
+处理：在 `docker-compose.yml` 配置宿主机局域网 IP（可多值逗号分隔）：
+
+```yaml
+environment:
+  EASYSYNC_TLS_SANS: "192.168.50.234"
+command: ["-addr", ":7788", "-data", "/data", "-https", "-tls-sans", "192.168.50.234"]
+```
+
+然后重建/重启：
+
+```bash
+cd /workspace/easysync
+docker compose up -d --build
+# 确认叶子 SAN 含该 IP（Root CA 不变，客户端无需重装 CA）
+openssl x509 -in data/https-cert.pem -noout -ext subjectAltName
+```
 
 ### 3.2 获取证书的两种方式
 

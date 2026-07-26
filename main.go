@@ -10,8 +10,10 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -32,6 +34,9 @@ func main() {
 	useHTTPS := flag.Bool("https", false, "enable HTTPS with a self-signed certificate")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file")
 	tlsKey := flag.String("tls-key", "", "TLS private key file")
+	// Extra SANs for auto HTTPS leaf (also reads EASYSYNC_TLS_SANS). Required in Docker
+	// so https://<host-LAN-IP>:7788 matches the certificate (not only localhost).
+	tlsSANs := flag.String("tls-sans", os.Getenv(EnvTLSExtraSANs), "comma-separated extra DNS/IP SANs for auto HTTPS leaf (e.g. 192.168.50.234)")
 	flag.Parse()
 
 	store, err := NewStore(*dataDir)
@@ -55,17 +60,20 @@ func main() {
 	mux.HandleFunc("/api/conversations/", conversationHandler(store, hub))
 	mux.HandleFunc("/api/messages/", messageHandler(store, hub))
 	mux.HandleFunc("/api/uploads", uploadHandler(store, hub))
-	mux.HandleFunc("/uploads/", serveUploadHandler(*dataDir))
+	mux.HandleFunc("/uploads/", serveUploadHandler(*dataDir, store))
 	mux.HandleFunc("/ws", hub.ServeWS)
 	mux.Handle("/", spaHandler())
 
 	printStartup(*addr, *dataDir, *useHTTPS)
 	if *useHTTPS {
-		material, err := EnsureTLSMaterial(*dataDir, *tlsCert, *tlsKey)
+		material, err := EnsureTLSMaterial(*dataDir, *tlsCert, *tlsKey, *tlsSANs)
 		if err != nil {
 			log.Fatal(err)
 		}
 		fmt.Printf("  Root CA:  %s (download /api/ca.crt)\n", material.RootCACert)
+		if *tlsSANs != "" {
+			fmt.Printf("  TLS SANs: %s (+ local IPs / localhost)\n", *tlsSANs)
+		}
 		server := &http.Server{
 			Addr:    *addr,
 			Handler: logRequests(mux),
@@ -283,11 +291,20 @@ func uploadHandler(store *Store, hub *Hub) http.HandlerFunc {
 		}
 
 		url := "/uploads/" + storedName
+		mimeType := header.Header.Get("Content-Type")
+		if mimeType == "" || mimeType == "application/octet-stream" {
+			mimeType = contentTypeForFilename(header.Filename)
+		}
+		// Prefer extension-based type for formats mobile browsers often mis-handle
+		// when servers sniff ZIP/text (apk→zip, toml→txt).
+		if preferred := contentTypeForFilename(header.Filename); preferred != "application/octet-stream" {
+			mimeType = preferred
+		}
 		attachment := &Attachment{
 			URL:        url,
 			Name:       header.Filename,
 			StoredName: storedName,
-			MimeType:   header.Header.Get("Content-Type"),
+			MimeType:   mimeType,
 			Size:       written,
 		}
 		if messageType == "image" {
@@ -315,12 +332,141 @@ func uploadHandler(store *Store, hub *Hub) http.HandlerFunc {
 	}
 }
 
-func serveUploadHandler(dataDir string) http.HandlerFunc {
+func serveUploadHandler(dataDir string, store *Store) http.HandlerFunc {
 	root := filepath.Join(dataDir, "uploads")
-	fileServer := http.StripPrefix("/uploads/", http.FileServer(http.Dir(root)))
 	return func(w http.ResponseWriter, r *http.Request) {
-		fileServer.ServeHTTP(w, r)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// URL is /uploads/<storedName> where storedName is a flat hash+ext file.
+		name := path.Base(strings.TrimPrefix(r.URL.Path, "/uploads/"))
+		name = path.Clean(name)
+		if name == "." || name == "/" || name == ".." || strings.Contains(name, "/") || strings.Contains(name, `\`) {
+			http.NotFound(w, r)
+			return
+		}
+		full := filepath.Join(root, name)
+		// Ensure resolved path stays under uploads root.
+		if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		info, err := os.Stat(full)
+		if err != nil || info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+
+		downloadName := name
+		mimeType := contentTypeForFilename(name)
+		if store != nil {
+			if att, ok := store.FindAttachmentByStoredName(name); ok {
+				if att.Name != "" {
+					downloadName = att.Name
+				}
+				// Prefer extension-derived type over stored sniff/upload MIME so
+				// mobile Edge/Chrome do not rename apk→.apk.zip or toml→.toml.txt.
+				if preferred := contentTypeForFilename(downloadName); preferred != "application/octet-stream" {
+					mimeType = preferred
+				} else if att.MimeType != "" {
+					mimeType = att.MimeType
+				}
+			}
+		}
+
+		setAttachmentDownloadHeaders(w, downloadName, mimeType)
+		http.ServeFile(w, r, full)
 	}
+}
+
+// setAttachmentDownloadHeaders forces a stable filename and Content-Type so
+// mobile browsers (especially Edge/Chrome on Android) do not append .zip/.txt
+// based on sniffed MIME (ZIP magic for APK, text/plain for TOML).
+func setAttachmentDownloadHeaders(w http.ResponseWriter, filename, contentType string) {
+	if contentType == "" {
+		contentType = contentTypeForFilename(filename)
+	}
+	w.Header().Set("Content-Type", contentType)
+	// Prevent intermediate caches / browsers from re-sniffing.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// attachment + RFC 5987 filename* keeps original extension on mobile downloads.
+	w.Header().Set("Content-Disposition", contentDispositionAttachment(filename))
+}
+
+func contentDispositionAttachment(filename string) string {
+	filename = strings.ReplaceAll(filename, `"`, `'`)
+	filename = strings.ReplaceAll(filename, "\r", "")
+	filename = strings.ReplaceAll(filename, "\n", "")
+	if filename == "" {
+		filename = "download"
+	}
+	// ASCII fallback + UTF-8 filename* for non-ASCII names.
+	escaped := url.PathEscape(filename)
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, filename, escaped)
+}
+
+// contentTypeForFilename maps common extensions to types that preserve the
+// original suffix when Android browsers save the file. Avoid application/zip
+// for .apk and text/plain for .toml/.md etc.
+func contentTypeForFilename(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".apk":
+		return "application/vnd.android.package-archive"
+	case ".aab":
+		return "application/octet-stream"
+	case ".ipa":
+		return "application/octet-stream"
+	case ".toml":
+		return "application/toml"
+	case ".yaml", ".yml":
+		return "application/yaml"
+	case ".json":
+		return "application/json"
+	case ".md", ".markdown":
+		return "text/markdown; charset=utf-8"
+	case ".txt", ".log", ".csv":
+		return "text/plain; charset=utf-8"
+	case ".pdf":
+		return "application/pdf"
+	case ".zip":
+		return "application/zip"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".rar":
+		return "application/vnd.rar"
+	case ".gz", ".tgz":
+		return "application/gzip"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".mp4":
+		return "video/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wasm":
+		return "application/wasm"
+	case ".exe", ".dll", ".bin", ".dat":
+		return "application/octet-stream"
+	}
+	if ext != "" {
+		if t := mime.TypeByExtension(ext); t != "" {
+			// Do not let generic text/plain win for unknown-but-mapped types on
+			// mobile; only use stdlib when it is more specific.
+			if t != "text/plain" && !strings.HasPrefix(t, "text/plain;") {
+				return t
+			}
+		}
+	}
+	return "application/octet-stream"
 }
 
 func uploadRootFromStore(store *Store) string {

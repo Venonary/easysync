@@ -218,6 +218,30 @@ func (s *Store) DeleteConversation(id string) error {
 	return s.saveLocked()
 }
 
+// FindAttachmentByStoredName looks up the original attachment metadata by the
+// on-disk stored filename under /uploads/<storedName>.
+func (s *Store) FindAttachmentByStoredName(storedName string) (Attachment, bool) {
+	storedName = strings.TrimSpace(storedName)
+	if storedName == "" {
+		return Attachment{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.Messages {
+		if m.Attachment == nil {
+			continue
+		}
+		if m.Attachment.StoredName == storedName {
+			return *m.Attachment, true
+		}
+		// Fallback: URL ends with /uploads/<storedName>
+		if strings.HasSuffix(m.Attachment.URL, "/"+storedName) || strings.HasSuffix(m.Attachment.URL, storedName) {
+			return *m.Attachment, true
+		}
+	}
+	return Attachment{}, false
+}
+
 func (s *Store) AddMessage(message Message) (Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

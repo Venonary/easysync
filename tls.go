@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,10 @@ const (
 	rootCAKeyFileName  = "easysync-root-ca-key.pem"
 	serverCertFileName = "https-cert.pem"
 	serverKeyFileName  = "https-key.pem"
+	// EnvTLSExtraSANs is a comma-separated list of extra DNS names / IPs
+	// for the auto-issued server leaf (needed when running in Docker where
+	// the container cannot see the host LAN IP such as 192.168.50.234).
+	EnvTLSExtraSANs = "EASYSYNC_TLS_SANS"
 )
 
 // TLSMaterial holds paths for the persistent root CA and server leaf.
@@ -32,7 +37,11 @@ type TLSMaterial struct {
 // EnsureTLSMaterial creates or reuses a root CA and a server certificate signed by it.
 // If certFile and keyFile are both provided by the operator, those server files are used as-is
 // and the root CA is still ensured for download/install convenience when possible.
-func EnsureTLSMaterial(dataDir, certFile, keyFile string) (TLSMaterial, error) {
+//
+// extraSANs lists additional DNS names or IP addresses that the leaf must cover
+// (e.g. the host LAN IP when EasySync runs inside Docker). Values from the
+// EASYSYNC_TLS_SANS environment variable are always merged in.
+func EnsureTLSMaterial(dataDir, certFile, keyFile string, extraSANs ...string) (TLSMaterial, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return TLSMaterial{}, err
 	}
@@ -65,14 +74,18 @@ func EnsureTLSMaterial(dataDir, certFile, keyFile string) (TLSMaterial, error) {
 		return TLSMaterial{}, err
 	}
 
+	dnsNames, ipAddrs := buildServerSANs(extraSANs...)
+
 	if filesExist(material.ServerCert, material.ServerKey) {
-		// Reuse existing leaf if it still chains to our CA; otherwise reissue.
-		if leafChainsToCA(material.ServerCert, caCert) {
+		// Reuse existing leaf only if it still chains to our CA AND covers required SANs.
+		// Docker often reuses a leaf that only has localhost — browsers then show
+		// net::ERR_CERT_COMMON_NAME_INVALID for https://<LAN-IP>:7788.
+		if leafChainsToCA(material.ServerCert, caCert) && leafCoversSANs(material.ServerCert, dnsNames, ipAddrs) {
 			return material, nil
 		}
 	}
 
-	if err := generateServerLeaf(material.ServerCert, material.ServerKey, caCert, caKey); err != nil {
+	if err := generateServerLeaf(material.ServerCert, material.ServerKey, caCert, caKey, dnsNames, ipAddrs); err != nil {
 		return TLSMaterial{}, err
 	}
 	return material, nil
@@ -129,7 +142,7 @@ func generateRootCA(certPath, keyPath string) error {
 	return writePEMFile(keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(privateKey), 0o600)
 }
 
-func generateServerLeaf(certPath, keyPath string, caCert *x509.Certificate, caKey *rsa.PrivateKey) error {
+func generateServerLeaf(certPath, keyPath string, caCert *x509.Certificate, caKey *rsa.PrivateKey, dnsNames []string, ipAddrs []net.IP) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err
@@ -140,15 +153,31 @@ func generateServerLeaf(certPath, keyPath string, caCert *x509.Certificate, caKe
 		return err
 	}
 
+	if len(dnsNames) == 0 {
+		dnsNames = []string{"localhost"}
+	}
+	if len(ipAddrs) == 0 {
+		ipAddrs = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	}
+
+	// Prefer a LAN IP as CN when present so browser error text is less confusing.
+	cn := "EasySync"
+	for _, ip := range ipAddrs {
+		if v4 := ip.To4(); v4 != nil && !v4.IsLoopback() {
+			cn = v4.String()
+			break
+		}
+	}
+
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
-		Subject:      pkix.Name{CommonName: "EasySync", Organization: []string{"EasySync"}},
+		Subject:      pkix.Name{CommonName: cn, Organization: []string{"EasySync"}},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().AddDate(1, 0, 0),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  collectLocalIPs(),
+		DNSNames:     dnsNames,
+		IPAddresses:  ipAddrs,
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &privateKey.PublicKey, caKey)
@@ -159,6 +188,51 @@ func generateServerLeaf(certPath, keyPath string, caCert *x509.Certificate, caKe
 		return err
 	}
 	return writePEMFile(keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(privateKey), 0o600)
+}
+
+// buildServerSANs merges localhost/local IPs with CLI/env extra SANs.
+func buildServerSANs(extra ...string) (dnsNames []string, ipAddrs []net.IP) {
+	dnsSet := map[string]struct{}{"localhost": {}}
+	ipSet := map[string]struct{}{
+		"127.0.0.1": {},
+		"::1":       {},
+	}
+
+	add := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if ip := net.ParseIP(raw); ip != nil {
+			ipSet[ip.String()] = struct{}{}
+			return
+		}
+		dnsSet[strings.ToLower(raw)] = struct{}{}
+	}
+
+	for _, e := range extra {
+		for _, part := range strings.Split(e, ",") {
+			add(part)
+		}
+	}
+	if env := os.Getenv(EnvTLSExtraSANs); env != "" {
+		for _, part := range strings.Split(env, ",") {
+			add(part)
+		}
+	}
+	for _, ip := range collectLocalIPs() {
+		ipSet[ip.String()] = struct{}{}
+	}
+
+	for d := range dnsSet {
+		dnsNames = append(dnsNames, d)
+	}
+	for s := range ipSet {
+		if ip := net.ParseIP(s); ip != nil {
+			ipAddrs = append(ipAddrs, ip)
+		}
+	}
+	return dnsNames, ipAddrs
 }
 
 func collectLocalIPs() []net.IP {
@@ -189,15 +263,7 @@ func collectLocalIPs() []net.IP {
 }
 
 func leafChainsToCA(leafPath string, caCert *x509.Certificate) bool {
-	leafPEM, err := os.ReadFile(leafPath)
-	if err != nil {
-		return false
-	}
-	block, _ := pem.Decode(leafPEM)
-	if block == nil {
-		return false
-	}
-	leaf, err := x509.ParseCertificate(block.Bytes)
+	leaf, err := parseLeafCert(leafPath)
 	if err != nil {
 		return false
 	}
@@ -205,6 +271,56 @@ func leafChainsToCA(leafPath string, caCert *x509.Certificate) bool {
 	roots.AddCert(caCert)
 	_, err = leaf.Verify(x509.VerifyOptions{Roots: roots})
 	return err == nil
+}
+
+func parseLeafCert(leafPath string) (*x509.Certificate, error) {
+	leafPEM, err := os.ReadFile(leafPath)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(leafPEM)
+	if block == nil {
+		return nil, fmt.Errorf("invalid leaf PEM")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// leafCoversSANs reports whether the leaf certificate includes every required
+// DNS name and IP (used to decide whether to reissue after adding LAN SANs).
+func leafCoversSANs(leafPath string, dnsNames []string, ipAddrs []net.IP) bool {
+	leaf, err := parseLeafCert(leafPath)
+	if err != nil {
+		return false
+	}
+	dnsHave := map[string]struct{}{}
+	for _, d := range leaf.DNSNames {
+		dnsHave[strings.ToLower(d)] = struct{}{}
+	}
+	// Also accept CN as a weak fallback for DNS-only checks (legacy leaves).
+	if leaf.Subject.CommonName != "" {
+		dnsHave[strings.ToLower(leaf.Subject.CommonName)] = struct{}{}
+	}
+	for _, want := range dnsNames {
+		if _, ok := dnsHave[strings.ToLower(want)]; !ok {
+			return false
+		}
+	}
+	ipHave := map[string]struct{}{}
+	for _, ip := range leaf.IPAddresses {
+		ipHave[ip.String()] = struct{}{}
+	}
+	for _, want := range ipAddrs {
+		if _, ok := ipHave[want.String()]; !ok {
+			// Normalize IPv4-mapped forms
+			if v4 := want.To4(); v4 != nil {
+				if _, ok := ipHave[v4.String()]; ok {
+					continue
+				}
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyLeafAgainstRoot loads PEM files and verifies the leaf chains to the root CA.

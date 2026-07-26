@@ -27,6 +27,8 @@ func TestDockerComposeHTTPSDefaults(t *testing.T) {
 		{"bind-mount data", "./data:/data"},
 		{"healthcheck https URL", "https://127.0.0.1:7788/api/health"},
 		{"healthcheck skip verify", "--no-check-certificate"},
+		{"LAN IP SAN for browsers", "192.168.50.234"},
+		{"tls-sans flag or env", "tls-sans"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(text, c.want) {

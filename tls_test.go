@@ -56,6 +56,73 @@ func TestEnsureTLSMaterialCreatesCAAndLeafChain(t *testing.T) {
 	}
 }
 
+// TestEnsureTLSMaterialReissuesWhenExtraSANMissing covers the Docker case:
+// leaf only has localhost, then operator adds LAN IP via -tls-sans / EASYSYNC_TLS_SANS.
+// Root CA must stay the same; only the leaf is reissued (no client reinstall of CA).
+func TestEnsureTLSMaterialReissuesWhenExtraSANMissing(t *testing.T) {
+	dir := t.TempDir()
+	first, err := EnsureTLSMaterial(dir, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootBefore, err := os.ReadFile(first.RootCACert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafBefore, err := os.ReadFile(first.ServerCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	extraIP := "192.168.50.234"
+	second, err := EnsureTLSMaterial(dir, "", "", extraIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootAfter, err := os.ReadFile(second.RootCACert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafAfter, err := os.ReadFile(second.ServerCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rootBefore) != string(rootAfter) {
+		t.Fatal("root CA must not change when only reissuing leaf for extra SANs")
+	}
+	if string(leafBefore) == string(leafAfter) {
+		t.Fatal("expected leaf to be reissued when required LAN SAN was missing")
+	}
+	if err := VerifyLeafAgainstRoot(second.RootCACert, second.ServerCert); err != nil {
+		t.Fatalf("reissued leaf must still chain to same root: %v", err)
+	}
+
+	leaf, err := parseLeafCert(second.ServerCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ip := range leaf.IPAddresses {
+		if ip.String() == extraIP {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("reissued leaf missing IP SAN %s; have %v", extraIP, leaf.IPAddresses)
+	}
+
+	// Third call with same SANs must reuse the new leaf.
+	third, err := EnsureTLSMaterial(dir, "", "", extraIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafThird, _ := os.ReadFile(third.ServerCert)
+	if string(leafAfter) != string(leafThird) {
+		t.Fatal("expected leaf reuse once required SANs are present")
+	}
+}
+
 func TestRootCADownloadHandler(t *testing.T) {
 	dir := t.TempDir()
 	material, err := EnsureTLSMaterial(dir, "", "")

@@ -13,8 +13,11 @@ services:
     environment:
       EASYSYNC_DATA: /data
       EASYSYNC_HTTPS: "true"
+      # Host LAN IP must be in the leaf SAN; containers only see docker bridge IPs.
+      # Comma-separate multiple names/IPs. Clients install Root CA once; leaf reissues keep the same CA.
+      EASYSYNC_TLS_SANS: "192.168.50.234"
     # HTTPS on :7788 — same as bare binary: -https -addr :7788
-    command: ["-addr", ":7788", "-data", "/data", "-https"]
+    command: ["-addr", ":7788", "-data", "/data", "-https", "-tls-sans", "192.168.50.234"]
     healthcheck:
       # Alpine busybox wget; --no-check-certificate for self-signed / private CA
       test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:7788/api/health"]
